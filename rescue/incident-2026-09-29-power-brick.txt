@@ -1,0 +1,36 @@
+# DGX Spark `spark-d4d5` — outage of 2026-09-29: power brick failure
+
+**Verdict:** external power supply (the OEM 240 W USB-C PD brick) failed after ~12.5 h of sustained GPU training load. The host recorded no fault of any kind. It came back cleanly on a replacement brick on 2026-09-30 16:30 EDT. Because the failure happened under load, the known GB10 hard-power-off-under-GPU-load mode cannot be excluded on host evidence alone — but the brick's physical symptoms point at the brick (see below).
+
+## Timeline (all times EDT, from the Spark's systemd journal and `last`)
+
+| When | Event |
+|---|---|
+| 2026-09-21 11:33:21 | Boot of the affected session (kernel 7.0.0-1019-nvidia). Uptime at failure: 8 days 1 h. |
+| 2026-09-25 17:08–17:16 | Four OOM kills of `python` in user session 485 (RSS 45 GB → 102 GB). Unrelated to the outage; noted for completeness. |
+| 2026-09-26 → 09-28 | Nine `NVRM: NV_ERR_NO_MEMORY` GPU allocation failures under unified-memory pressure. Non-fatal, unrelated. |
+| 2026-09-28 23:50 → 09-29 | LoRA fine-tune `ivans-ft/runs_v8/lora_r16_e1_v8` running the whole time (985 steps at ~70 s/step, checkpoint-600 written 11:25). Sustained GPU load for ~12.5 h. |
+| 2026-09-29 12:18:59–12:19:12 | Last interactive SSH sessions (3249, 3250) open and close normally. |
+| 2026-09-29 12:35:33 | A Docker container starts (`mystifying_montalcini`, bridge network). |
+| 2026-09-29 12:37:06 | Container exits normally after 1 min 34 s CPU; network teardown completes cleanly. |
+| 2026-09-29 12:36:14 | Last TensorBoard event file write. |
+| 2026-09-29 12:38:32 | Last write to `runs_v8/overnight.log`: step 650/985, 66 %, 12:30:19 elapsed. Training healthy and progressing. |
+| 2026-09-29 12:38:45 | tailscaled switches home DERP relay from derp-27 to derp-1 (nyc) — routine. |
+| **2026-09-29 12:39:00** | **Last journal line** (`magicsock: 1 active derp conns`). Journal ends mid-stream, ~30 s after the last training log write. |
+| 2026-09-29 (after) | Box and brick found cold and silent; an iPhone would not charge from the brick; 5-minute unplug did not revive it. |
+| 2026-09-30 16:30:16 | First boot on the third-party 240 W 48 V/5 A PD3.1 brick. Normal boot, no recovery messages. |
+
+## What the diagnostics show
+
+- **No shutdown or power-off record.** `last -x` shows the 09-21 boot as the previous entry with no matching `shutdown`; `journalctl --list-boots` shows boot −1 simply ending at 12:39:00. A software-initiated poweroff, reboot or panic would have logged.
+- **No kernel activity at all in the final 39 minutes** (only an unrelated apparmor audit line at 12:00:51). No thermal throttle, no `Xid`, no NVRM error, no watchdog, no MCE, no hung-task, no OOM.
+- **pstore is empty** (`sudo ls -la /sys/fs/pstore` → nothing). The kernel captured no panic or oops. It never saw anything go wrong.
+- **The box was under sustained GPU load at the moment of failure.** v8 training had been running ~12.5 h and wrote its log 28 s before the kernel's last line. (An earlier draft of this report called the box "idle" because the systemd journal shows no GPU activity — training processes don't write to the journal, and post-reboot `nvidia-smi` shows the current state, not the state at the crash. The file mtimes are authoritative.) This means the known GB10 "hard power-off under sustained GPU load" mode is a candidate on host evidence alone; it is a board/firmware-side power trip and would leave the brick alive.
+- **The host-side signature is indistinguishable from the community-documented GB10 embedded-controller power cut** (NVIDIA forums t/384492, t/373251; tonyd2wild/dgx-spark-hard-poweroff-fix): sustained load, GPU power swinging 18–95 W, SoC ~96 °C, EC cuts power before Linux can write a line — journal stops, no panic, empty pstore. That is exactly what this box's logs look like.
+- **The brick's symptoms separate the two candidates.** After the event the brick was cold, an iPhone would not charge from it, and a 5-minute unplug did not revive it. A GB10 board-side trip does not kill the brick's PD output; a dead brick explains every observation. The most likely reading is that the brick failed under a long, high-draw session — which is also exactly when a marginal brick would give out.
+- **Post-boot health on the new brick:** GPU 35 °C, 4 W draw, idle, clocks unlocked (default max 3003 MHz). Root filesystem 227 G / 3.7 T (7 %). `mlx5_core: insufficient power on the PCIe slot (27W)` appears 2× at boot, exactly as it did on the previous boot — benign firmware quirk, not new.
+- **Limitation:** the platform exposes no `/sys/class/typec` or `/sys/class/power_supply` nodes, so Linux cannot report what the brick negotiated (voltage/current/PD revision) on either boot. The brick's failure is inferred from the physical symptoms plus the total absence of any host-side fault, which together leave no other candidate.
+
+## Conclusion
+
+Input power was removed abruptly while the host was healthy and under sustained training load. Nothing on the host indicates a host fault; the brick's own post-mortem symptoms (no PD output, would not charge a phone) point at the brick. Keep the NVIDIA RMA open for the OEM brick; the unit does not need to go back. Because the failure occurred under load, apply the GPU clock lock before resuming training and treat any repeat on the new brick as evidence for the board-side mode instead.
