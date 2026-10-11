@@ -67,18 +67,12 @@ hue() {
   fi
 }
 
-# AWS SSO state. Read from the token cache rather than $AWS_PROFILE: tmux runs this with the
-# server's environment, which may predate `spark auth aws`, and the token is the thing that
-# actually expires. The file list is collected before grepping -- piping an empty list into
-# `xargs grep` runs grep with no operands, and it then reads stdin and hangs the prompt forever.
+# AWS SSO state: ok / idle / expired / none, from the shared `aws-sso-state` helper (installed next
+# to this script; the shell prompt reads the same one, so the two clouds agree). idle = the access
+# token lapsed and a renewal probe is in flight -- NOT an auth failure, do not re-login; expired =
+# the probe failed or nothing is left to renew with: run `spark auth aws` from the laptop.
 aws_state() {
-  local files exp now
-  files=$(grep -l '"accessToken"' "$HOME"/.aws/sso/cache/*.json 2>/dev/null)
-  [ -n "$files" ] || { printf 'none'; return; }
-  exp=$(grep -ho '"expiresAt": *"[^"]*"' $files 2>/dev/null | sed 's/.*"\([^"]*\)".*/\1/' | sort | tail -1)
-  exp=${exp:0:19}
-  now=$(date -u +%Y-%m-%dT%H:%M:%S)
-  if [ -n "$exp" ] && [[ "$exp" > "$now" ]]; then printf 'ok'; else printf 'expired'; fi
+  aws-sso-state 2>/dev/null || printf 'none'
 }
 
 # bytes/sec -> a FIXED four characters, always: 3 digits plus a unit. A variable-width field
@@ -168,8 +162,9 @@ mem_seg=$(printf '#[fg=#8a8a8a]MEM %s%s %3d/%sG' "$(hue "$mem_pct")" "$(sparklin
 
 # Nerd Font cloud, same glyph the shell prompt uses, so the two agree at a glance.
 case "$(aws_state)" in
-  ok) aws_seg=$(printf '#[fg=#6ec46e]\uf0c2') ;;
-  *)  aws_seg=$(printf '#[fg=#e06c6c]\uf0c2') ;;
+  ok)   aws_seg=$(printf '#[fg=#6ec46e]\uf0c2') ;;
+  idle) aws_seg=$(printf '#[fg=#d9b44a]\uf0c2') ;;   # amber: renews on next use
+  *)    aws_seg=$(printf '#[fg=#e06c6c]\uf0c2') ;;
 esac
 
 # Segment order, left to right. Network leads so that on a narrow client (a phone) the least

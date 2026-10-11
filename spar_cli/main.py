@@ -7,6 +7,8 @@ Every verb shells out to the system ssh/scp/rsync so Tailscale SSH, agent forwar
 
 from __future__ import annotations
 
+import configparser
+import hashlib
 import json
 import os
 import platform
@@ -260,23 +262,42 @@ def _merge_aws_config(local: str, remote: str) -> tuple[str, list[str]]:
     return text, kept
 
 
+def _sso_token_cache_name(profile: str) -> str:
+    """The cache file the AWS CLI reads for this profile's sign-in: `sha1(<sso_session name>).json`, or
+    `sha1(<sso_start_url>).json` for a legacy profile without an `sso-session`. Reading THAT file is the
+    only honest report. Scanning the whole cache directory (the old behaviour) picked up dead tokens from
+    earlier sign-ins and reported "signed in; renews automatically" off a July file while the live token
+    had already lost its refresh ability -- which is how the box kept dying unnoticed in 2026-10."""
+    parser = configparser.ConfigParser()
+    parser.read(Path.home() / ".aws" / "config")
+    section = "default" if profile == "default" else f"profile {profile}"
+    if not parser.has_section(section):
+        raise SystemExit(f"profile {profile!r} is not in ~/.aws/config")
+    key = parser[section].get("sso_session") or parser[section].get("sso_start_url")
+    if not key:
+        raise SystemExit(
+            f"profile {profile!r} has neither sso_session nor sso_start_url; `spark auth aws` only manages SSO profiles"
+        )
+    return hashlib.sha1(key.encode()).hexdigest() + ".json"
+
+
 def _aws_report(c: cfg.Config, profiles: list[str]) -> bool:
     """Verify each profile ON THE BOX and print which role it resolves to, plus how long the shared
     SSO sign-in has left. The sign-in is what matters for long jobs: while it is alive the CLI
     re-mints role credentials silently, so a job only dies when the sign-in itself lapses. Returns
     True only if every profile resolved."""
     probe = " ".join(shlex.quote(p) for p in profiles)
+    token_file = '"$HOME/.aws/sso/cache/' + _sso_token_cache_name(profiles[0]) + '"'  # name is hex + .json
     script = (
         f"for p in {probe}; do "
         'if out=$(aws sts get-caller-identity --profile "$p" --query Arn --output text 2>&1); '
         'then printf \'OK|%s|%s\\n\' "$p" "$out"; '
         'else printf \'ERR|%s|%s\\n\' "$p" "$(printf \'%s\' "$out" | tail -1)"; fi; done; '
-        # File list first: an empty list piped into `xargs grep` makes grep read stdin and hang.
-        "files=$(grep -l '\"accessToken\"' ~/.aws/sso/cache/*.json 2>/dev/null); exp=''; "
-        '[ -n "$files" ] && exp=$(grep -ho \'"expiresAt": *"[^"]*"\' $files '
-        '| sed \'s/.*"\\([^"]*\\)".*/\\1/\' | sort | tail -1); '
+        # Only the token file the CLI itself resolves for this profile; never a directory-wide grep.
+        f"f={token_file}; exp=''; "
+        '[ -f "$f" ] && exp=$(grep -ho \'"expiresAt": *"[^"]*"\' "$f" | sed \'s/.*"\\([^"]*\\)".*/\\1/\'); '
         "printf 'EXP|%s\\n' \"$exp\"; "
-        "[ -n \"$files\" ] && grep -lq '\"refreshToken\"' $files && echo 'REFRESH|yes' || echo 'REFRESH|no'"
+        "[ -f \"$f\" ] && grep -q '\"refreshToken\"' \"$f\" && echo 'REFRESH|yes' || echo 'REFRESH|no'"
     )
     out = _remote(c, script, capture=True).stdout
     ok = True
@@ -332,7 +353,9 @@ def auth_aws(
         help="report which role each profile resolves to on the box and whether the SSO sign-in is live; no login, no copy",
     ),
 ) -> None:
-    """Log in to AWS SSO here (browser flow), then push the SSO token cache + ~/.aws/config to the Spark so boto3 there is authenticated without a device code, and persist AWS_PROFILE/AWS_REGION there for every shell.
+    """Log in to AWS SSO here (browser flow, one click), then push the SSO token cache + ~/.aws/config to the Spark so boto3 there is authenticated without a device code, and persist AWS_PROFILE/AWS_REGION there for every shell. ONE sign-in covers both machines.
+
+    Sharing the sign-in is safe and deliberate. Identity Center does not rotate or invalidate a refresh token on use (verified 2026-09-26, and again 2026-10-10: the box renewed its copy 17h after the laptop had renewed the same one). What ends a sign-in on BOTH machines at once is the Identity Center portal-session lifetime, which no local file records -- `aws-sso-state` probes for it (see dotfiles/aws-sso-state.sh). A 2026-10-09 rewrite had the box mint its own sign-in via device code on a "competing lineage" theory; that doubled the logins, added a device-code step, and fixed nothing, so it was reverted.
 
     With `aws_batch_profile` set, one sign-in covers both profiles (they share an `sso-session`), and both are verified on the box. AWS_PROFILE stays the interactive profile; long jobs opt in with AWS_PROFILE=<batch profile>. `--check` is the pre-flight for a multi-hour run.
     """
@@ -348,8 +371,6 @@ def auth_aws(
         if not skip_login:
             _run(["aws", "sso", "login", "--profile", profile])
         _remote(c, "mkdir -p ~/.aws/sso/cache && chmod 700 ~/.aws")
-        # Sharing one sign-in between machines is safe: verified 2026-09-26 that Identity Center does
-        # not rotate or invalidate refresh tokens on use, so both can refresh the same one in any order.
         # This machine's profiles are MERGED into the box's config, not copied over it: sections defined
         # here win, sections that exist only on the box (e.g. a Roles Anywhere profile whose cert paths
         # exist only there) are kept verbatim. The box's previous config is kept as config.spark-auth-bak.
@@ -364,8 +385,9 @@ def auth_aws(
         )
         if kept:
             typer.secho(f"kept box-only AWS sections: {', '.join(kept)}", fg="bright_black", err=True)
-        # --update, no --delete: a token the box refreshed (or a login done on the box) is newer than
-        # ours and must survive, and cache files for other sessions on the box aren't ours to remove.
+        # --update, no --delete: a token the box refreshed is newer than ours and must survive, and cache
+        # files for other sessions on the box aren't ours to remove. Agents on the box are hook-blocked
+        # from `aws sso login` (~/.claude/hooks/block_sso_login.py); this push is how the box gets signed in.
         _run([*_rsync(c), "-a", "--update", f"{aws_dir}/sso/cache/", f"{c.target}:~/.aws/sso/cache/"])
         _persist_remote_env(c, {"AWS_PROFILE": profile, "AWS_REGION": region})
 
@@ -944,7 +966,7 @@ def drive_status(lines: int = typer.Option(3, help="log lines per job")) -> None
 
 sync_app = typer.Typer(
     no_args_is_help=True,
-    help="Keep a tool's state in step between the laptop and the Spark: `spark sync claude`. One subcommand per tool — editors and other agents get their own as they are needed. For plain files and directories use `spark push` / `spark pull` instead.",
+    help="Keep a tool's state in step between the laptop and the Spark: `spark sync claude`, `spark sync dotfiles` (sparkbar, tmux-osc52, starship.toml). One subcommand per tool — editors and other agents get their own as they are needed. For plain files and directories use `spark push` / `spark pull` instead.",
 )
 app.add_typer(sync_app, name="sync")
 
@@ -1059,6 +1081,50 @@ def sync_claude(
         _merge_memory(c, local_mem, remote_mem)
         _run([*transcripts, f"{c.target}:{remote_proj}/", f"{local_proj}/"])
     typer.secho(f"claude config, memory and sessions {direction}ed ({local_proj} <-> {remote_proj})", fg="green")
+
+
+DOTFILES = Path(__file__).resolve().parent.parent / "dotfiles"
+# Helpers the box's tmux calls, installed to ~/.local/bin exactly as the bootstrap does (same source files, same names).
+DOTFILE_BINS = {"sparkbar.sh": "sparkbar", "tmux-osc52.sh": "tmux-osc52", "aws-sso-state.sh": "aws-sso-state"}
+# Read by the shared starship.toml, so it has to exist on the laptop too.
+LAPTOP_BINS = {"aws-sso-state.sh": "aws-sso-state"}
+# The bootstrap copies tmux.conf only when the box has none; sync pushes it unconditionally and re-sources it.
+TMUX_CONF = "tmux.conf"
+STARSHIP_LINK = "~/.config/starship.toml"
+
+
+@sync_app.command("dotfiles")
+def sync_dotfiles() -> None:
+    """Push the shell-chrome files to the Spark: `dotfiles/sparkbar.sh` and `dotfiles/tmux-osc52.sh` into the box's `~/.local/bin` (what the bootstrap installs, re-run without the rest of the bootstrap), and the laptop's starship.toml onto the box's; `aws-sso-state` is also installed into the LAPTOP's `~/.local/bin`, because the shared starship.toml calls it on both machines. starship.toml is a symlink into the `conf` checkout on BOTH machines, so each side is resolved with `readlink -f` and the real file is copied -- this pushes the laptop's WORKING TREE, not a commit; conf is dirty on both machines by design, and the two status indicators (sparkbar's cloud, starship's cloud) must agree, so they move together. Also pushes `dotfiles/tmux.conf` to `~/.tmux.conf` (the bootstrap only seeds it when absent) and re-sources it in the running server, then refreshes the status line so the new sparkbar shows on the next tick."""
+    c = cfg.load()
+    for src, name in DOTFILE_BINS.items():
+        path = DOTFILES / src
+        if not path.exists():
+            raise typer.BadParameter(f"{path} missing -- is this an editable install of the spar-cli checkout?")
+    local_starship = Path(STARSHIP_LINK).expanduser()
+    if not local_starship.exists():
+        raise typer.BadParameter(f"{local_starship} not found on the laptop")
+    local_starship = local_starship.resolve()
+    remote_starship = _run([*_ssh_base(c), _bash(f"readlink -f {STARSHIP_LINK}")], capture=True).stdout.strip()
+    if not remote_starship:
+        raise typer.BadParameter(f"{STARSHIP_LINK} not found on the Spark -- link it to the conf checkout first")
+
+    local_bin = Path.home() / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    for src, name in LAPTOP_BINS.items():
+        _run(["install", "-m", "755", str(DOTFILES / src), str(local_bin / name)])
+    _remote(c, "mkdir -p ~/.local/bin")
+    for src, name in DOTFILE_BINS.items():
+        # scp onto the live path, then install-style mode: tmux re-reads the script each tick, so no restart.
+        _run([*_scp(c), str(DOTFILES / src), f"{c.target}:~/.local/bin/{name}"])
+    _remote(c, "chmod 755 " + " ".join(f"~/.local/bin/{n}" for n in DOTFILE_BINS.values()))
+    _run([*_scp(c), str(local_starship), f"{c.target}:{remote_starship}"])
+    _run([*_scp(c), str(DOTFILES / TMUX_CONF), f"{c.target}:~/.tmux.conf"])
+    _remote(c, "tmux source-file ~/.tmux.conf 2>/dev/null; tmux refresh-client -S 2>/dev/null; true")
+    typer.secho(
+        f"dotfiles pushed: {', '.join(DOTFILE_BINS.values())} -> ~/.local/bin, {local_starship} -> {remote_starship}",
+        fg="green",
+    )
 
 
 # --------------------------------------------------------------------------- config
