@@ -14,13 +14,18 @@
 # CPU and network are RATES and need two samples, so the first tick after a reboot reads 0 rather
 # than a meaningless since-boot average.
 #
-# Three renderers, picked by SPARKBAR_STYLE (default `octants`):
-#   octants -- bars at TWO samples per cell, four height levels: each cell is a 2x4 grid of
-#              Unicode 16 octant blocks (U+1CD00..), so 32 samples (~96s) fit where 16 bars did.
-#              tmux 3.4 counts them as width 1 (probed 2026-10-16), Iosevka draws them natively and
-#              Ghostty synthesises them; a font without them shows tofu -- switch to `bars`.
-#   braille -- the same 2x4 geometry as a dot-matrix LINE plot: one dot per sample. Lighter on the
-#              eye than octants, which is why it is not the default.
+# Three renderers, picked by SPARKBAR_STYLE (default `braille`):
+#   braille -- a 2x4 dot-matrix LINE plot, one dot per sample, two samples per cell, so 32 samples
+#              (~96s) fit where 16 bars did. U+2800 glyphs: Unicode 3.0, width 1 in every layer
+#              between the script and the pixels (glibc, tmux, mosh, Ghostty). The default because
+#              it is the only two-per-cell style that survives mosh -- see octants.
+#   octants -- the same 2x4 geometry as solid bars: Unicode 16 octant blocks (U+1CD00..). Heavier
+#              and prettier, but NOT over mosh: glibc 2.39 (Unicode 15.1) and mosh 1.4.0 return
+#              wcwidth -1 for them while tmux 3.4 and Ghostty count 1, so mosh's screen model and
+#              the real glyph positions drift by the number of octants on screen. Because that
+#              count changes every tick, the cloud at the far right moves without mosh repainting
+#              the cells it left, and a ghost cloud (or two) stays on screen at a varying distance
+#              (seen 2026-10-19). Fine over plain ssh, or once mosh ships Unicode 16 tables.
 #   bars    -- the classic ▁▂▃▄▅▆▇█ sparkline, one sample per cell, eight levels, rendered by
 #              holman/spark (github.com/holman/spark). It installs as `spark` -- same name as the
 #              laptop-side CLI in this repo, but a different machine, so they never share a PATH:
@@ -34,7 +39,7 @@
 set -uo pipefail
 
 STATE="/tmp/sparkbar-${USER:-$(id -un)}.state"
-STYLE=${SPARKBAR_STYLE:-octants}
+STYLE=${SPARKBAR_STYLE:-braille}
 N=${SPARKBAR_SAMPLES:-$([ "$STYLE" = bars ] && echo 16 || echo 32)}
 INTERVAL=${SPARKBAR_INTERVAL:-3}
 
