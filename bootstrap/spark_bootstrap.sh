@@ -134,7 +134,7 @@ rclone version | head -1
 # ---- tmux config + the helpers it calls ----------------------------------------
 # The config only when the user has none: status bar on top with machine vitals, focus-events for
 # Claude Code, 0ms escape-time, OSC 52 clipboard to the laptop. The helpers it calls are always
-# refreshed: sparkbar (status-right), aws-sso-state (its AWS cloud, shared with the prompt),
+# refreshed: sparkbar (status-right) and its sampler service, aws-sso-state (its AWS cloud, shared with the prompt),
 # holman/spark (draws its sparklines) and tmux-osc52
 # (copy-command; the only OSC 52 form mosh forwards -- see dotfiles/tmux-osc52.sh).
 step tmux-conf
@@ -149,6 +149,10 @@ if [ -d "$SELF_DOTFILES" ]; then
   install -m 755 "$SELF_DOTFILES/sparkbar.sh" "$HOME/.local/bin/sparkbar"
   install -m 755 "$SELF_DOTFILES/tmux-osc52.sh" "$HOME/.local/bin/tmux-osc52"
   install -m 755 "$SELF_DOTFILES/aws-sso-state.sh" "$HOME/.local/bin/aws-sso-state"
+  # sparkbar's sampler: keeps vitals history rolling while no tmux client is attached.
+  mkdir -p "$HOME/.config/systemd/user"
+  install -m 644 "$SELF_DOTFILES/sparkbar-sampler.service" "$HOME/.config/systemd/user/sparkbar-sampler.service"
+  systemctl --user daemon-reload && systemctl --user enable --now sparkbar-sampler.service && systemctl --user restart sparkbar-sampler.service
 fi
 if [ ! -x "$HOME/.local/bin/spark" ]; then
   curl -fsSL https://raw.githubusercontent.com/holman/spark/master/spark -o "$HOME/.local/bin/spark"

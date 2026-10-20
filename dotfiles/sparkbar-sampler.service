@@ -1,0 +1,15 @@
+# Samples machine vitals for the tmux status bar every SPARKBAR_INTERVAL seconds, so history keeps
+# accumulating while no tmux client is attached. Installed to ~/.config/systemd/user by the bootstrap
+# and by `spark sync dotfiles`; `sparkbar` (status-right) only reads what this writes.
+[Unit]
+Description=sparkbar vitals sampler (tmux status-bar history)
+
+[Service]
+ExecStart=%h/.local/bin/sparkbar --collect-loop
+Restart=always
+RestartSec=3
+# nvidia-smi and sparkbar itself live outside the user manager's default PATH.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

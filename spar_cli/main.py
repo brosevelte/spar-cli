@@ -966,7 +966,7 @@ def drive_status(lines: int = typer.Option(3, help="log lines per job")) -> None
 
 sync_app = typer.Typer(
     no_args_is_help=True,
-    help="Keep a tool's state in step between the laptop and the Spark: `spark sync claude`, `spark sync dotfiles` (sparkbar, tmux-osc52, starship.toml). One subcommand per tool — editors and other agents get their own as they are needed. For plain files and directories use `spark push` / `spark pull` instead.",
+    help="Keep a tool's state in step between the laptop and the Spark: `spark sync claude`, `spark sync dotfiles` (sparkbar + its sampler service, tmux-osc52, starship.toml). One subcommand per tool — editors and other agents get their own as they are needed. For plain files and directories use `spark push` / `spark pull` instead.",
 )
 app.add_typer(sync_app, name="sync")
 
@@ -1090,6 +1090,8 @@ DOTFILE_BINS = {"sparkbar.sh": "sparkbar", "tmux-osc52.sh": "tmux-osc52", "aws-s
 LAPTOP_BINS = {"aws-sso-state.sh": "aws-sso-state"}
 # The bootstrap copies tmux.conf only when the box has none; sync pushes it unconditionally and re-sources it.
 TMUX_CONF = "tmux.conf"
+# Sampler for sparkbar's history; runs under the systemd user manager so it keeps sampling while no tmux client is attached.
+SAMPLER_UNIT = "sparkbar-sampler.service"
 STARSHIP_LINK = "~/.config/starship.toml"
 
 
@@ -1120,9 +1122,13 @@ def sync_dotfiles() -> None:
     _remote(c, "chmod 755 " + " ".join(f"~/.local/bin/{n}" for n in DOTFILE_BINS.values()))
     _run([*_scp(c), str(local_starship), f"{c.target}:{remote_starship}"])
     _run([*_scp(c), str(DOTFILES / TMUX_CONF), f"{c.target}:~/.tmux.conf"])
+    _remote(c, "mkdir -p ~/.config/systemd/user")
+    _run([*_scp(c), str(DOTFILES / SAMPLER_UNIT), f"{c.target}:~/.config/systemd/user/{SAMPLER_UNIT}"])
+    # Restart (not just enable) so a changed sparkbar.sh is what the loop runs from now on.
+    _remote(c, f"systemctl --user daemon-reload && systemctl --user enable --now {SAMPLER_UNIT} && systemctl --user restart {SAMPLER_UNIT}")
     _remote(c, "tmux source-file ~/.tmux.conf 2>/dev/null; tmux refresh-client -S 2>/dev/null; true")
     typer.secho(
-        f"dotfiles pushed: {', '.join(DOTFILE_BINS.values())} -> ~/.local/bin, {local_starship} -> {remote_starship}",
+        f"dotfiles pushed: {', '.join(DOTFILE_BINS.values())} -> ~/.local/bin, {SAMPLER_UNIT} (restarted), {local_starship} -> {remote_starship}",
         fg="green",
     )
 
