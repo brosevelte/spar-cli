@@ -14,11 +14,15 @@
 # CPU and network are RATES and need two samples, so the first tick after a reboot reads 0 rather
 # than a meaningless since-boot average.
 #
-# Three renderers, picked by SPARKBAR_STYLE (default `braille`):
-#   braille -- a 2x4 dot-matrix LINE plot, one dot per sample, two samples per cell, so 32 samples
-#              (~96s) fit where 16 bars did. U+2800 glyphs: Unicode 3.0, width 1 in every layer
-#              between the script and the pixels (glibc, tmux, mosh, Ghostty). The default because
-#              it is the only two-per-cell style that survives mosh -- see octants.
+# Four renderers, picked by SPARKBAR_STYLE (default `sextants`):
+#   sextants -- filled bars at TWO samples per cell, three height levels (plus empty): each cell is
+#              a 2x3 grid of Unicode 13 sextant blocks (U+1FB00..), so 32 samples (~96s) fit where
+#              16 bars did. The default because it is the only FILLED two-per-cell style whose width
+#              every layer agrees on -- glibc 2.39, macOS libc, tmux 3.4, mosh 1.4.0 (both ends call
+#              libc wcwidth) and Ghostty all say 1 (probed 2026-10-21). Octants would add a fourth
+#              level but do not survive mosh; see below.
+#   braille -- a 2x4 dot-matrix LINE plot, one dot per sample, two samples per cell. U+2800,
+#              Unicode 3.0, width 1 everywhere. Lighter on the eye than filled bars.
 #   octants -- the same 2x4 geometry as solid bars: Unicode 16 octant blocks (U+1CD00..). Heavier
 #              and prettier, but NOT over mosh: glibc 2.39 (Unicode 15.1) and mosh 1.4.0 return
 #              wcwidth -1 for them while tmux 3.4 and Ghostty count 1, so mosh's screen model and
@@ -39,7 +43,7 @@
 set -uo pipefail
 
 STATE="/tmp/sparkbar-${USER:-$(id -un)}.state"
-STYLE=${SPARKBAR_STYLE:-braille}
+STYLE=${SPARKBAR_STYLE:-sextants}
 N=${SPARKBAR_SAMPLES:-$([ "$STYLE" = bars ] && echo 16 || echo 32)}
 INTERVAL=${SPARKBAR_INTERVAL:-3}
 
@@ -94,6 +98,25 @@ octant_bars() {
   LC_ALL=C.UTF-8 printf "$out"
 }
 
+# Sextant bars: SEXT[a*4+b] is the cell whose left column has `a` of 3 blocks lit from the bottom
+# and whose right column has `b`. Sextants are numbered by cell (1 2 / 3 4 / 5 6), and the four
+# patterns that already existed as block elements (empty, left half, right half, full) have no
+# SEXTANT codepoint, hence the U+258C/U+2590/U+2588 entries. Generated and name-checked against
+# UnicodeData.txt; regenerate rather than hand-edit.
+SEXT=(0020 1FB1E 1FB26 2590 1FB0F 1FB2D 1FB35 1FB37 1FB13 1FB31 1FB39 1FB3B 258C 1FB32 1FB3A 2588)
+
+# sextant_bars <lit 0..3 ...> -- two samples per cell; an odd count leaves the first cell's left
+# column empty so the newest sample is always the rightmost column.
+sextant_bars() {
+  local -a lv=("$@")
+  local i out=""
+  ((${#lv[@]} % 2)) && lv=(0 "${lv[@]}")
+  for ((i = 0; i < ${#lv[@]}; i += 2)); do
+    printf -v out '%s\\U%08x' "$out" "0x${SEXT[lv[i] * 4 + lv[i + 1]]}"
+  done
+  LC_ALL=C.UTF-8 printf "$out"
+}
+
 # braille_line <levels 0..3 ...> -- two levels per cell; an odd count leaves the first cell's
 # left column empty so the newest sample is always the rightmost dot.
 braille_line() {
@@ -115,10 +138,12 @@ sparkline() {
   shift
   local -a v=("$@")
   ((${#v[@]})) || return
-  if [ "$STYLE" = braille ] || [ "$STYLE" = octants ]; then
+  if [ "$STYLE" = braille ] || [ "$STYLE" = octants ] || [ "$STYLE" = sextants ]; then
     # Four levels, 0..3. Fixed scale for percentages: 0-24, 25-49, 50-74, 75-100. Braille lights
     # the dot AT the level (0 = floor dot); octants light level+1 blocks from the bottom, so the
-    # floor is a one-quarter bar like the old ▁ and a full bar means >=75%.
+    # floor is a one-quarter bar like the old ▁ and a full bar means >=75%. Sextants have only
+    # three blocks, so levels 0 and 1 share the one-block floor (an empty column would read as
+    # "no data", not "low"): <50% one block, 50-74 two, >=75 full.
     local -a lv=()
     if [ "$kind" = pct ]; then
       for x in "${v[@]}"; do lv+=($((x >= 75 ? 3 : x / 25))); done
@@ -135,6 +160,10 @@ sparkline() {
       local -a lit=()
       for x in "${lv[@]}"; do lit+=($((x + 1))); done
       octant_bars "${lit[@]}"
+    elif [ "$STYLE" = sextants ]; then
+      local -a lit=()
+      for x in "${lv[@]}"; do lit+=($((x > 0 ? x : 1))); done
+      sextant_bars "${lit[@]}"
     else
       braille_line "${lv[@]}"
     fi
