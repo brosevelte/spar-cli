@@ -1,0 +1,119 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "spark",
+  "title": "Spark",
+  "description": "Drive the persistent mosh → tmux session on the Spark from Raycast: jump to Claude, send it a message, open its agents view, start sessions, switch panes and repos.",
+  "icon": "icon.png",
+  "author": "cartertiernan",
+  "license": "MIT",
+  "categories": ["Developer Tools"],
+  "commands": [
+    {
+      "name": "goto-claude",
+      "title": "Go to Claude",
+      "description": "Focus the Spark tab and make the Claude pane active",
+      "mode": "no-view"
+    },
+    {
+      "name": "send",
+      "title": "Send to Claude",
+      "description": "Type a message into the Claude pane on the Spark and submit it",
+      "mode": "no-view",
+      "arguments": [{ "name": "message", "placeholder": "message", "type": "text", "required": true }]
+    },
+    {
+      "name": "agents-page",
+      "title": "Claude Agents Page",
+      "description": "Open Claude Code's agents view in the Claude pane",
+      "mode": "no-view"
+    },
+    {
+      "name": "agents",
+      "title": "Search Claude Agents",
+      "description": "Search the background agents on the Spark; open one in a new tmux window",
+      "mode": "view"
+    },
+    {
+      "name": "new-session",
+      "title": "New Claude Session",
+      "description": "Start a Claude session in a repo, in a new tmux window",
+      "mode": "view"
+    },
+    {
+      "name": "second-pane",
+      "title": "Go to Shell Pane",
+      "description": "Focus the Spark tab and make the shell pane (pane 2) active",
+      "mode": "no-view"
+    },
+    {
+      "name": "goto-repo",
+      "title": "Go to Repo",
+      "description": "cd the shell pane into a repo under ~/src on the Spark",
+      "mode": "view"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "sshHost",
+      "title": "SSH host alias",
+      "description": "Alias in ~/.ssh/config with ControlMaster (written by `spark raycast install`)",
+      "type": "textfield",
+      "default": "spark-ctl",
+      "required": false
+    },
+    {
+      "name": "session",
+      "title": "tmux session",
+      "description": "Session that `spark layout` builds",
+      "type": "textfield",
+      "default": "c1",
+      "required": false
+    },
+    {
+      "name": "window",
+      "title": "tmux window",
+      "description": "Window holding the Claude pane (1) and the shell pane (2)",
+      "type": "textfield",
+      "default": "claude",
+      "required": false
+    },
+    {
+      "name": "tabMatch",
+      "title": "Ghostty tab match",
+      "description": "Substring of the Ghostty tab title that holds the mosh session",
+      "type": "textfield",
+      "default": "[mosh]",
+      "required": false
+    },
+    {
+      "name": "srcDir",
+      "title": "Repos directory",
+      "description": "Directory on the Spark whose children are offered as repos",
+      "type": "textfield",
+      "default": "~/src",
+      "required": false
+    },
+    {
+      "name": "agentsKey",
+      "title": "Agents view key",
+      "description": "tmux key name that opens Claude Code's agents view when the prompt is empty",
+      "type": "textfield",
+      "default": "Down",
+      "required": false
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.104.10",
+    "@raycast/utils": "^2.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "build": "ray build -e dist",
+    "dev": "ray develop",
+    "lint": "ray lint"
+  }
+}

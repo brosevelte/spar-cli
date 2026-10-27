@@ -77,6 +77,8 @@ Set `port = 22` in the config if your box has no Tailscale SSH and you want the 
 | `spark auth mcp` | hold open the OAuth callback forward (`localhost:54545`) so `/mcp` authentication on the box can complete in your browser. **Short-lived on purpose** — a Claude Code running locally uses the same port, so a permanent forward would stop it binding, or would silently tunnel a *local* login to the box. Ctrl-C when done |
 | `spark auth claude [--copy]` | sign the remote Claude Code into your subscription. Default runs `claude auth login` there and **opens its sign-in URL in your local browser automatically** — the box has no browser, so the CLI watches the session output under a pty and opens the URL the moment it's printed, while keeping the session interactive in case it asks for a pasted code. The box gets its own token. `--copy` pushes this Mac's Keychain token instead — no browser, but both machines then refresh one token and can log each other out |
 | `spark sync dotfiles` | push the shell chrome to the box: `dotfiles/sparkbar.sh`, `dotfiles/tmux-osc52.sh` and `dotfiles/aws-sso-state.sh` into `~/.local/bin`, and `dotfiles/sparkbar-sampler.service` into `~/.config/systemd/user` (enabled and restarted, so the loop runs the new script) (what the bootstrap installs; `aws-sso-state` also lands in the laptop's `~/.local/bin` since the shared prompt calls it), plus the laptop's `starship.toml` onto the box's (both are symlinks into the `conf` checkout; each side is `readlink -f`-resolved and the working-tree file is copied, not a commit). Also `dotfiles/tmux.conf` → `~/.tmux.conf`, re-sourced in the running server. Run it after editing any of these |
+| `spark layout [name]` | give a tmux session the fixed shape everything else assumes: window `claude` with Claude Code in pane 1 and a shell in pane 2, both in `claude_project`. Idempotent: a session built by hand is adopted (the window holding Claude is renamed, auto-rename switched off), nothing running is touched, Claude is only started into a bare shell prompt. `spark mosh <name>` / `spark tmux` run it before attaching (`--no-layout` skips). See "Raycast" |
+| `spark raycast install` | one-shot, idempotent setup for the Raycast extension in `raycast/`: the `spark-ctl` ssh alias (ControlMaster, regenerated from the config), `macos-applescript = true` in the Ghostty config, then `npm install` + `ray build`, which installs the extension straight into Raycast. Re-run after editing the extension or changing host/port |
 | `spark sync claude [--init] [--direction pull]` | keep Claude Code in step: global config, the project memory dir (**merged**, never mirrored — agents on both machines write memories, so notes copy both ways with the newer copy winning, nothing is deleted, and `MEMORY.md` is combined line by line), and **every past session** — transcripts plus their subagent/tool-result/workflow sidecars, which is what populates the resume list. `--init` also does one-time remote setup (registers the chrome-devtools MCP) |
 | `spark push <src> [dest]` | mirror a local path up. Target defaults to the same path under `$HOME`. Resumable; excludes venvs/node_modules/caches/worktrees unless `--no-exclude`; never deletes without `--delete`; re-homes copied `/Users/...` symlinks to the remote `$HOME` |
 | `spark pull <src> [dest]` | the inverse, for a file or directory |
@@ -214,6 +216,24 @@ If it hangs at `Authenticating... Trying none...`, that's Tailscale SSH's `check
 - **`dotfiles/find-mcp-auth-url.py`** — digs the pending MCP OAuth URL out of Claude Code's logs when the TUI won't show it.
 - **`dotfiles/ssh-extra-port.conf`** — the systemd socket drop-in above.
 - **`dotfiles/glyphtest.sh`** — renders candidate prompt glyph sets in your terminal's font, flush and spaced, so you can pick one by eye. Mixing a plain-text glyph with Nerd Font icons gives mismatched advance widths and they visually collide.
+
+## Raycast: driving the mosh → tmux session from the launcher
+
+`raycast/` is a small Raycast extension ("Spark") for getting at the persistent session without touching the keyboard chord for it. None of its commands are Ghostty operations: each is a tmux command on the box, plus one AppleScript call that brings the Ghostty tab running mosh to the front. tmux is what gives the layout names, so the extension depends on the `spark layout` shape — session `c1` (a preference), window `claude`, pane 1 Claude Code, pane 2 a shell.
+
+| command | what it does |
+|---|---|
+| Go to Claude | focus the mosh tab, select window `claude`, pane 1 |
+| Send to Claude `<message>` | type the message into pane 1 (`send-keys -l`) and press Enter, then focus. It goes to whatever pane 1 is showing: the chat in a running session; on a cold `claude` start in a repo that opens on the fleet view, it dispatches a background agent instead |
+| Claude Agents Page | press the agents-view key (↓, a preference) in pane 1 — Claude Code's own "↓ to manage" view |
+| Search Claude Agents | list from `claude agents --json --all` on the box, newest first, state and age as accessories. Enter opens the job in a new tmux window (`claude --resume <session>`); other actions open the agents page, copy the session id or the resume command |
+| New Claude Session | pick a repo under `~/src` on the box; new tmux window there running `claude` (or `claude --continue`, or just a shell) |
+| Go to Shell Pane | select pane 2 and focus |
+| Go to Repo | pick a repo; a literal `cd` typed into pane 2 (deterministic where `z fra` depends on frecency) |
+
+Setup is `spark raycast install`, then restart Ghostty once (the AppleScript flag only takes effect on launch). Latency is what makes this usable: the extension talks to the box through the `spark-ctl` alias, multiplexed over one persistent master connection (`ControlMaster auto`, 4h persist), so a command round-trips in ~40ms instead of a ~500ms handshake. The alias is separate from `Host spark` on purpose — Zed, Rune and mosh never share the socket. The remote login shell is fish, whose quoting isn't POSIX, so the extension never puts a script on ssh's command line: it pipes it to `bash -ls` on stdin.
+
+Preferences (Raycast → Extensions → Spark): ssh alias, tmux session (default `c1`), window (`claude`), Ghostty tab match (`[mosh]`), repos directory (`~/src`), agents-view key (`Down`). If your `tmux_session` in the spark config isn't `c1`, set the session preference to match.
 
 ## Images: pasting screenshots into a remote Claude session
 
