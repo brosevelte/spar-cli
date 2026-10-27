@@ -27,10 +27,10 @@ app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 
 
 def _run(
-    cmd: list[str], *, check: bool = True, capture: bool = False, stdin: str | None = None
+    cmd: list[str], *, check: bool = True, capture: bool = False, stdin: str | None = None, cwd: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
     typer.secho("$ " + " ".join(shlex.quote(c) for c in cmd), fg="bright_black", err=True)
-    return subprocess.run(cmd, check=check, text=True, capture_output=capture, input=stdin)
+    return subprocess.run(cmd, check=check, text=True, capture_output=capture, input=stdin, cwd=cwd)
 
 
 def _conn_opts(c: cfg.Config) -> list[str]:
@@ -146,15 +146,59 @@ def ssh(no_chrome: bool = typer.Option(False, help="don't start the debug Chrome
     _interactive_ssh(c, None, tunnel=inline)
 
 
+# The fixed shape of a working session, so anything driving tmux from outside (the Raycast
+# extension in raycast/) can address panes by name instead of guessing: window LAYOUT_WINDOW,
+# pane 1 running Claude Code, pane 2 a shell beside it, both in the configured project.
+LAYOUT_WINDOW = "claude"
+SHELLS = "fish bash zsh sh"
+
+
+def _layout_script(session: str, window: str, cwd: str) -> str:
+    """Idempotent: creates whatever is missing and touches nothing that exists. `cwd` is relative to the remote $HOME. Claude is only started
+    when pane 1 is sitting at a bare shell prompt -- never typed into a running program."""
+    s, w, d = shlex.quote(session), shlex.quote(window), shlex.quote(cwd)
+    return (
+        f'S={s}; W={w}; D="$HOME"/{d}; '
+        'tmux has-session -t "$S" 2>/dev/null || tmux new-session -d -s "$S" -n "$W" -c "$D"; '
+        # No window by that name yet: adopt one that already has Claude in pane 1 (a session built by
+        # hand, auto-named after whatever ran first) before resorting to a new one.
+        'if ! tmux list-windows -t "$S" -F "#W" | grep -qx "$W"; then '
+        '  i=$(tmux list-panes -s -t "$S" -F "#I #P #{pane_current_command}" | awk \'$2==1 && $3=="claude" {print $1; exit}\'); '
+        '  if [ -n "$i" ]; then tmux rename-window -t "$S:$i" "$W"; else tmux new-window -t "$S" -n "$W" -c "$D"; fi; '
+        "fi; "
+        # The name is the contract; stop tmux renaming it after the foreground command.
+        'tmux set-option -w -t "$S:$W" automatic-rename off; '
+        '[ "$(tmux list-panes -t "$S:$W" | wc -l)" -ge 2 ] || tmux split-window -h -t "$S:$W" -c "$D"; '
+        'cmd=$(tmux display-message -p -t "$S:$W.1" "#{pane_current_command}"); '
+        f'case " {SHELLS} " in *" $cmd "*) tmux send-keys -t "$S:$W.1" claude Enter;; esac; '
+        'tmux select-window -t "$S:$W"; '
+        'echo "$S: window $W, pane 1 $(tmux display-message -p -t "$S:$W.1" "#{pane_current_command}"), pane 2 $(tmux display-message -p -t "$S:$W.2" "#{pane_current_command}")"'
+    )
+
+
+def _ensure_layout(c: cfg.Config, session: str) -> None:
+    _remote(c, _layout_script(session, LAYOUT_WINDOW, c.claude_project))
+
+
+@app.command()
+def layout(session: str = typer.Argument(None, help="session (default from config)")) -> None:
+    """Make a tmux session on the Spark match the fixed shape the Raycast extension assumes: window `claude` with Claude Code in pane 1 and a shell in pane 2, both in `claude_project`. Idempotent -- run against a live session it changes nothing; run against nothing it builds the whole thing. `spark mosh`/`spark tmux` do this before attaching."""
+    c = cfg.load()
+    _ensure_layout(c, session or c.tmux_session)
+
+
 @app.command()
 def tmux(
     session: str = typer.Argument(None, help="session name (default from config: main)"),
     no_chrome: bool = typer.Option(False, help="don't start the debug Chrome / tunnel"),
+    no_layout: bool = typer.Option(False, help="attach as-is, don't build the `spark layout` shape"),
 ) -> None:
-    """Attach to a named tmux session on the Spark, creating it if missing. Sessions survive dropped ssh connections, so Claude and dev servers run here (e.g. `spark tmux main`, `spark tmux fe`)."""
+    """Attach to a named tmux session on the Spark, creating it if missing. Sessions survive dropped ssh connections, so Claude and dev servers run here (e.g. `spark tmux main`, `spark tmux fe`). The session gets the `spark layout` shape first (window `claude`: Claude in pane 1, shell in pane 2) unless --no-layout."""
     c = cfg.load()
     name = session or c.tmux_session
     inline = False if no_chrome else _ensure_browser_path(c)
+    if not no_layout:
+        _ensure_layout(c, name)
     _interactive_ssh(c, f"tmux new-session -A -s {shlex.quote(name)}", tunnel=inline)
 
 
@@ -165,10 +209,11 @@ def mosh(
         False, "--tmux", help="land in a tmux session: the config default (main), or the one named"
     ),
     no_chrome: bool = typer.Option(False, help="don't start the debug Chrome / tunnel"),
+    no_layout: bool = typer.Option(False, help="attach as-is, don't build the `spark layout` shape"),
 ) -> None:
     """A login shell on the Spark over mosh: survives sleep, wifi changes and roaming instead of dying with the TCP connection. `--tmux` lands in the default session (main) instead; `spark mosh --tmux fe` (or just `spark mosh fe`) attaches-or-creates session `fe`. mosh can't forward ports, so the Chrome path comes from the `spark tunnel` agent -- this refuses to fall back to nothing silently.
 
-    mosh has no scrollback of its own, so anything long-lived belongs in tmux. Inside tmux, `prefix N` prompts for a new session and `prefix s` switches between them.
+    mosh has no scrollback of its own, so anything long-lived belongs in tmux. Inside tmux, `prefix N` prompts for a new session and `prefix s` switches between them. A tmux session gets the `spark layout` shape before attaching (window `claude`: Claude in pane 1, shell in pane 2) unless --no-layout, so the Raycast extension can always find its way around.
     """
     c = cfg.load()
     if not no_chrome and _ensure_browser_path(c):
@@ -182,7 +227,10 @@ def mosh(
     inner = " ".join(["ssh", "-p", str(c.port), *_conn_opts(c)])
     cmd = ["mosh", f"--ssh={inner}", c.target]
     if tmux or session:
-        cmd += ["--", "tmux", "new-session", "-A", "-s", session or c.tmux_session]
+        name = session or c.tmux_session
+        if not no_layout:
+            _ensure_layout(c, name)
+        cmd += ["--", "tmux", "new-session", "-A", "-s", name]
     os.execvp(cmd[0], cmd)
 
 
@@ -1125,10 +1173,97 @@ def sync_dotfiles() -> None:
     _remote(c, "mkdir -p ~/.config/systemd/user")
     _run([*_scp(c), str(DOTFILES / SAMPLER_UNIT), f"{c.target}:~/.config/systemd/user/{SAMPLER_UNIT}"])
     # Restart (not just enable) so a changed sparkbar.sh is what the loop runs from now on.
-    _remote(c, f"systemctl --user daemon-reload && systemctl --user enable --now {SAMPLER_UNIT} && systemctl --user restart {SAMPLER_UNIT}")
+    _remote(
+        c,
+        f"systemctl --user daemon-reload && systemctl --user enable --now {SAMPLER_UNIT} && systemctl --user restart {SAMPLER_UNIT}",
+    )
     _remote(c, "tmux source-file ~/.tmux.conf 2>/dev/null; tmux refresh-client -S 2>/dev/null; true")
     typer.secho(
         f"dotfiles pushed: {', '.join(DOTFILE_BINS.values())} -> ~/.local/bin, {SAMPLER_UNIT} (restarted), {local_starship} -> {remote_starship}",
+        fg="green",
+    )
+
+
+# --------------------------------------------------------------------------- raycast
+
+raycast_app = typer.Typer(
+    no_args_is_help=True,
+    help="The Raycast extension in raycast/: jump to Claude, send it a message, open its agents view, start sessions, switch panes and repos -- all against the `spark layout` shape of the tmux session.",
+)
+app.add_typer(raycast_app, name="raycast")
+
+RAYCAST_DIR = Path(__file__).resolve().parent.parent / "raycast"
+# A second ssh alias, not the one in `spark`'s own options: multiplexed over a persistent master so a
+# tmux command round-trips in ~40ms instead of a fresh handshake. Kept apart from `Host spark` so
+# Zed/Rune/mosh sessions never share the socket.
+CTL_HOST = "spark-ctl"
+SSH_BLOCK_BEGIN = "# >>> spark raycast (regenerated by `spark raycast install`) >>>"
+SSH_BLOCK_END = "# <<< spark raycast <<<"
+GHOSTTY_CONFIG = Path.home() / "Library" / "Application Support" / "com.mitchellh.ghostty" / "config"
+GHOSTTY_LINE = "macos-applescript = true"
+
+
+def _ssh_control_block(c: cfg.Config) -> str:
+    lines = [
+        SSH_BLOCK_BEGIN,
+        f"Host {CTL_HOST}",
+        f"    Hostname {c.host}",
+        f"    Port {c.port}",
+        "    IdentitiesOnly yes",
+        "    BatchMode yes",
+        "    ConnectTimeout 5",
+        "    ControlMaster auto",
+        "    ControlPath ~/.ssh/cm-%r@%h:%p",
+        "    ControlPersist 4h",
+        *(f"    {o.replace('=', ' ')}" for o in KEEPALIVE_OPTS[1::2]),
+    ]
+    if c.user:
+        lines.insert(2, f"    User {c.user}")
+    if c.identity_file:
+        lines.insert(3, f"    IdentityFile {c.identity_file}")
+    return "\n".join([*lines, SSH_BLOCK_END]) + "\n"
+
+
+def _replace_block(text: str, begin: str, end: str, block: str) -> str:
+    start, stop = text.find(begin), text.find(end)
+    if start >= 0 and stop > start:
+        return text[:start] + block + text[stop + len(end) + 1 :]
+    return text.rstrip("\n") + ("\n\n" if text.strip() else "") + block
+
+
+@raycast_app.command("install")
+def raycast_install() -> None:
+    """Set up everything the extension needs, idempotently: (1) the `spark-ctl` alias in ~/.ssh/config with ControlMaster, regenerated from the spark config; (2) `macos-applescript = true` in the Ghostty config, so Raycast can focus the mosh tab -- Ghostty must be restarted once after this; (3) `npm install` + `ray build` in raycast/, which drops the built extension straight into Raycast's extensions directory. Re-run after editing the extension or changing host/port."""
+    c = cfg.load()
+    ssh_config = Path.home() / ".ssh" / "config"
+    old = ssh_config.read_text() if ssh_config.exists() else ""
+    ssh_config.parent.mkdir(mode=0o700, exist_ok=True)
+    ssh_config.write_text(_replace_block(old, SSH_BLOCK_BEGIN, SSH_BLOCK_END, _ssh_control_block(c)))
+    typer.secho(f"~/.ssh/config: Host {CTL_HOST} -> {c.target}:{c.port} (ControlMaster)", fg="green")
+
+    restart = False
+    if GHOSTTY_CONFIG.exists():
+        text = GHOSTTY_CONFIG.read_text()
+        if not any(line.split("#")[0].strip() == GHOSTTY_LINE for line in text.splitlines()):
+            GHOSTTY_CONFIG.write_text(
+                text.rstrip("\n")
+                + f"\n\n# Raycast drives tabs via AppleScript (`spark raycast install`).\n{GHOSTTY_LINE}\n"
+            )
+            restart = True
+        typer.secho(
+            f"{GHOSTTY_CONFIG}: {GHOSTTY_LINE}" + (" (added -- restart Ghostty)" if restart else ""), fg="green"
+        )
+    else:
+        typer.secho(f"{GHOSTTY_CONFIG} not found: add `{GHOSTTY_LINE}` to your Ghostty config by hand", fg="yellow")
+
+    if not (RAYCAST_DIR / "package.json").exists():
+        raise typer.BadParameter(f"{RAYCAST_DIR} missing -- is this an editable install of the spar-cli checkout?")
+    _run(["npm", "install", "--no-audit", "--no-fund"], cwd=RAYCAST_DIR)
+    _run(["npx", "ray", "build", "-e", "dist"], cwd=RAYCAST_DIR)
+    _run(["ssh", CTL_HOST, "true"], check=False)  # warm the control socket so the first Raycast call is fast
+    typer.secho(
+        "Raycast extension 'Spark' installed. Commands: Go to Claude, Send to Claude, Claude Agents Page, Search Claude Agents, New Claude Session, Go to Shell Pane, Go to Repo. "
+        f"Its tmux session preference defaults to c1; set it to tmux_session ({c.tmux_session}) if they differ.",
         fg="green",
     )
 
