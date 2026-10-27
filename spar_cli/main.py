@@ -1231,9 +1231,33 @@ def _replace_block(text: str, begin: str, end: str, block: str) -> str:
     return text.rstrip("\n") + ("\n\n" if text.strip() else "") + block
 
 
+def _register_raycast_extension() -> None:
+    """`ray build` only writes files; the running Raycast app learns about a local extension from `ray develop`,
+    which registers it and then sits watching for changes. The registration outlives the process, so run it
+    until it reports the build, then stop it."""
+    cmd = ["npx", "ray", "develop", "-I"]
+    typer.secho("$ " + " ".join(cmd), fg="bright_black", err=True)
+    proc = subprocess.Popen(cmd, cwd=RAYCAST_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    assert proc.stdout is not None
+    built = False
+    try:
+        for line in proc.stdout:
+            typer.echo(line.rstrip(), err=True)
+            if "built extension successfully" in line:
+                built = True
+                break
+            if "error" in line.lower() and "warn" not in line.lower():
+                break
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+    if not built:
+        raise typer.BadParameter("ray develop did not report a successful build -- see the output above")
+
+
 @raycast_app.command("install")
 def raycast_install() -> None:
-    """Set up everything the extension needs, idempotently: (1) the `spark-ctl` alias in ~/.ssh/config with ControlMaster, regenerated from the spark config; (2) `macos-applescript = true` in the Ghostty config, so Raycast can focus the mosh tab -- Ghostty must be restarted once after this; (3) `npm install` + `ray build` in raycast/, which drops the built extension straight into Raycast's extensions directory. Re-run after editing the extension or changing host/port."""
+    """Set up everything the extension needs, idempotently: (1) the `spark-ctl` alias in ~/.ssh/config with ControlMaster, regenerated from the spark config; (2) `macos-applescript = true` in the Ghostty config, so Raycast can focus the mosh tab -- Ghostty must be restarted once after this; (3) `npm install` + `ray develop` in raycast/ until it reports the build, which registers the extension with the running Raycast (plain `ray build` writes files Raycast never notices). Re-run after editing the extension or changing host/port."""
     c = cfg.load()
     ssh_config = Path.home() / ".ssh" / "config"
     old = ssh_config.read_text() if ssh_config.exists() else ""
@@ -1259,7 +1283,7 @@ def raycast_install() -> None:
     if not (RAYCAST_DIR / "package.json").exists():
         raise typer.BadParameter(f"{RAYCAST_DIR} missing -- is this an editable install of the spar-cli checkout?")
     _run(["npm", "install", "--no-audit", "--no-fund"], cwd=RAYCAST_DIR)
-    _run(["npx", "ray", "build", "-e", "dist"], cwd=RAYCAST_DIR)
+    _register_raycast_extension()
     _run(["ssh", CTL_HOST, "true"], check=False)  # warm the control socket so the first Raycast call is fast
     typer.secho(
         "Raycast extension 'Spark' installed. Commands: Go to Claude, Send to Claude, Claude Agents Page, Search Claude Agents, New Claude Session, Go to Shell Pane, Go to Repo. "
