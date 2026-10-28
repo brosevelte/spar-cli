@@ -159,6 +159,20 @@ if [ ! -x "$HOME/.local/bin/spark" ]; then
   chmod +x "$HOME/.local/bin/spark"
 fi
 
+# ---- kitten: an image viewer that works inside tmux --------------------------------
+# `viu` draws half-block cells inside tmux no matter what: its renderer (viuer) disables the kitty
+# graphics protocol whenever $TMUX is set. `kitten icat` wraps the protocol in tmux passthrough
+# (tmux.conf has allow-passthrough on) so Ghostty draws real pixels through tmux over plain ssh.
+# Over mosh nothing draws pixels -- mosh re-renders the screen server-side and drops graphics
+# escapes -- so there both fall back to blocks; the file is fine (`spark paste` prints its size).
+# kitten is a static Go binary from the kitty release, so no sudo. Usage: kitten icat <png>
+step kitten
+if ! have kitten; then
+  curl -fsSL "$(gh_asset kovidgoyal/kitty 'kitten-linux-arm64$')" -o "$HOME/.local/bin/kitten"
+  chmod +x "$HOME/.local/bin/kitten"
+fi
+kitten --version
+
 # ---- personal conf repo (optional) -------------------------------------------
 # CONF_REPO=git@github.com:<you>/conf.git links the shell-agnostic subset; fish/starship/zed/Brewfile are Mac-only and skipped.
 step conf
