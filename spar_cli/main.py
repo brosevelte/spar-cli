@@ -35,7 +35,19 @@ def _run(
 
 def _conn_opts(c: cfg.Config) -> list[str]:
     """Port and key, shared by ssh/scp/rsync so every verb takes the same route onto the box."""
-    opts = ["-o", "IdentitiesOnly=yes"]
+    # Multiplex every hop over the persistent master the Raycast `spark-ctl` alias also uses (same
+    # ControlPath, so the socket is shared): a hop costs ~30ms instead of a ~300ms handshake. With
+    # no master alive the first hop starts one and persists it for 4h; nothing else changes.
+    opts = [
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPath=~/.ssh/cm-%r@%h:%p",
+        "-o",
+        "ControlPersist=4h",
+    ]
     if c.identity_file:
         opts += ["-i", str(Path(c.identity_file).expanduser())]
     return opts
@@ -549,32 +561,33 @@ def auth_claude(
 # --------------------------------------------------------------------------- clipboard
 
 # Writes the clipboard's image to a file, or exits non-zero when the clipboard holds no image.
-# `the clipboard as «class PNGf»` is the PNG flavour; TIFF ends up here from some apps, so the
-# handler tries PNG first and falls back rather than failing on a screenshot from the wrong source.
+# JXA over NSPasteboard rather than AppleScript's `write theData to fh`: AppleScript marshals the
+# blob through its own data type and takes ~1.2s on a 4k-wide screenshot; NSData.writeToFile is
+# ~80ms for the same bytes (measured 2026-10-27, byte-identical output). PNG is the flavour
+# Claude reads; TIFF is what some apps put there instead, so it is the fallback.
 _CLIPBOARD_PNG = """
-on writeData(theData, thePath)
-    set fh to open for access POSIX file thePath with write permission
-    set eof fh to 0
-    write theData to fh
-    close access fh
-end writeData
-try
-    writeData(the clipboard as «class PNGf», "%s")
-on error
-    try
-        writeData(the clipboard as «class TIFF», "%s")
-    on error
-        error "no image on the clipboard" number 1
-    end try
-end try
+ObjC.import("AppKit");
+var pb = $.NSPasteboard.generalPasteboard;
+var d = pb.dataForType($.NSPasteboardTypePNG);
+if (d.isNil()) d = pb.dataForType($.NSPasteboardTypeTIFF);
+if (d.isNil()) throw new Error("no image on the clipboard");
+if (!d.writeToFileAtomically(%s, true)) throw new Error("write failed");
 """
-
 
 # What the clipboard holds while an upload is in flight, or when it fails. Short and plainly not
 # a path, so a premature or failed paste is obvious in the prompt and quick to delete.
 PASTE_UPLOADING = "UPLOADING"
 PASTE_ERROR_UPLOAD = "ERROR: image upload failed"
 PASTE_ERROR_NO_IMAGE = "ERROR: no image on the clipboard"
+
+
+def _png_size(path: Path) -> str:
+    """`WxH` from the PNG header, so the upload's resolution is stated rather than guessed. Image viewers in a mosh session (viu, chafa) draw in half-block cells because mosh drops graphics escapes -- the blocky picture is the viewer, never the file -- and this is the number that says so."""
+    with path.open("rb") as fh:
+        head = fh.read(24)
+    if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        return "not a PNG"
+    return f"{int.from_bytes(head[16:20], 'big')}x{int.from_bytes(head[20:24], 'big')}"
 
 
 def _clip(text: str) -> None:
@@ -607,8 +620,13 @@ def paste(
         raise typer.BadParameter("clipboard capture is macOS-only")
     stamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
     local = Path(tempfile.gettempdir()) / f"clip-{stamp}.png"
-    script = _CLIPBOARD_PNG % (local, local)
-    if subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False).returncode != 0:
+    script = _CLIPBOARD_PNG % json.dumps(str(local))
+    if (
+        subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script], capture_output=True, text=True, check=False
+        ).returncode
+        != 0
+    ):
         _clip(PASTE_ERROR_NO_IMAGE)
         if notify:
             _notify("No image on the clipboard", "Copy a screenshot first.")
@@ -619,17 +637,25 @@ def paste(
     # file has LANDED, an error if it never will. Claiming it before the transfer also stops a
     # quick local paste returning the stale screenshot during the second or two an upload takes.
     _clip(PASTE_UPLOADING)
+    size = _png_size(local)
     try:
-        remote_dir = f"{_remote_home(c)}/clipboard"
+        # One round trip: make the directory, prune old uploads (nothing else writes here), and
+        # report $HOME so the published path is absolute. Plain bash, so ~/.profile can't pollute it.
+        remote_dir = _run(
+            [
+                *_ssh_base(c),
+                _bash(
+                    "mkdir -p ~/clipboard; "
+                    f"find ~/clipboard -name 'clip-*.png' -mtime +{retain_days} -delete 2>/dev/null; "
+                    'printf %s "$HOME/clipboard"'
+                ),
+            ],
+            capture=True,
+        ).stdout.strip()
         remote = f"{remote_dir}/{local.name}"
-        # Prune old uploads in the same round trip; nothing else writes this directory.
-        _remote(
-            c,
-            f"mkdir -p {shlex.quote(remote_dir)}; "
-            f"find {shlex.quote(remote_dir)} -name 'clip-*.png' -mtime +{retain_days} -delete 2>/dev/null; true",
-        )
         # rsync exits 0 only once the whole file is on the box, so the path is published after this.
-        _run([*_rsync(c), "-az", str(local), f"{c.target}:{remote}"])
+        # No -z: a PNG is already compressed, so it only burns CPU on both ends.
+        _run([*_rsync(c), "-a", str(local), f"{c.target}:{remote}"])
     except subprocess.CalledProcessError:
         _clip(PASTE_ERROR_UPLOAD)
         if notify:
@@ -639,8 +665,8 @@ def paste(
     if not keep:
         local.unlink(missing_ok=True)
     if notify:
-        _notify("Image uploaded", "Path copied — Cmd-V into the remote prompt")
-    typer.secho(f"{remote}  (copied to your clipboard — Cmd-V into the remote prompt)", fg="green")
+        _notify("Image uploaded", f"{size} — path copied, Cmd-V into the remote prompt")
+    typer.secho(f"{remote}  {size}  (copied to your clipboard — Cmd-V into the remote prompt)", fg="green")
 
 
 # --------------------------------------------------------------------------- chrome

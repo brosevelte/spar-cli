@@ -256,6 +256,8 @@ A paste can't block — `Cmd-V` reads whatever is on the clipboard at that insta
 | `ERROR: image upload failed` | nothing arrived (box unreachable, ssh down, rsync failed) |
 | `ERROR: no image on the clipboard` | copy a screenshot first |
 
+The command (and the `--notify` notification) also prints the upload's pixel size, e.g. `4604x1920`, read from the PNG header. That is the file's real resolution: nothing on this path resizes. If a clip looks like Lego when you `viu` it on the box, that is the viewer, not the file — mosh re-renders the screen server-side and drops kitty/iTerm/sixel graphics escapes, so any image viewer under mosh (with or without tmux) falls back to half-block cells. Claude reads the file from the path, never the terminal render, so it sees the full image. Inline images only work over plain `spark ssh` (tmux has `allow-passthrough on` for that); over mosh, trust the printed size.
+
 Short and plainly not a path, so a premature or failed paste is obvious and quick to delete — rather than a path to a missing file, which Claude would fail to read. The placeholder also stops a quick *local* paste returning the stale screenshot during the second or two a large upload takes.
 
 Bind it to a hotkey — `conf/skhdrc` has `Cmd-Shift-Opt-5` (capture a region *and* ship it, via `screencapture -i -c`) and `Cmd-Shift-Opt-V` (ship whatever image is already on the clipboard). skhd runs commands with a minimal PATH and never reads your shell config, so the binding needs the absolute path to `spark`.
