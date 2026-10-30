@@ -1,4 +1,4 @@
-import { Action, ActionPanel, Clipboard, Color, Icon, List, closeMainWindow, showHUD, showToast, Toast } from "@raycast/api";
+import { Action, ActionPanel, Clipboard, Color, Detail, Icon, List, closeMainWindow, showHUD, showToast, Toast } from "@raycast/api";
 import { useCachedPromise } from "@raycast/utils";
 import { execFile } from "node:child_process";
 import { useState } from "react";
@@ -26,6 +26,7 @@ interface Thread {
   updated_at: string;
   message_count: number;
   title: string | null;
+  children_atuin_ids?: string[] | null;
   preview: string | null; // the session's opening message
   last_reply: string | null;
 }
@@ -35,11 +36,17 @@ interface Snippet {
   matches?: [number, number][];
 }
 
-/** A row: the session, plus (for a search) the message that matched and where. */
-interface Hit {
-  thread: Thread;
-  match?: Snippet;
-  messageIndex?: number;
+/** One message that matched, and which thread it came from (the session itself or one of its subagents). */
+interface Match {
+  snippet: Snippet;
+  messageIndex: number;
+  from: Thread;
+}
+
+/** A row: a top-level session, plus (for a search) every match in it and its subagents, best first. */
+interface Row {
+  session: Thread;
+  matches: Match[];
 }
 
 interface Agent {
@@ -58,23 +65,42 @@ async function atuin(args: string[]): Promise<string> {
   return stdout;
 }
 
-async function loadThreads(text: string): Promise<Hit[]> {
+// Sessions spawn subagents, and atuin captures each as its own thread (1,452 of 1,570 here). Rows are
+// SESSIONS: a subagent hit is folded into its root session, and the matches show on the session's page.
+async function loadAll(): Promise<{ byId: Map<string, Thread>; parentOf: Map<string, string>; sessions: Thread[] }> {
+  const all = JSON.parse(await atuin(["threads", "list", "--style", "json"])) as Thread[];
+  const byId = new Map(all.map((t) => [t.atuin_id, t]));
+  const parentOf = new Map<string, string>();
+  for (const t of all) for (const c of t.children_atuin_ids ?? []) parentOf.set(c, t.atuin_id);
+  return { byId, parentOf, sessions: all.filter((t) => !parentOf.has(t.atuin_id)) };
+}
+
+function rootOf(id: string, parentOf: Map<string, string>): string {
+  for (let i = 0; i < 20 && parentOf.has(id); i++) id = parentOf.get(id)!;
+  return id;
+}
+
+async function loadRows(text: string): Promise<Row[]> {
+  const { byId, parentOf, sessions } = await loadAll();
   const words = text.trim().split(/\s+/).filter(Boolean);
-  if (words.length === 0) {
-    return (JSON.parse(await atuin(["threads", "list", "--style", "json"])) as Thread[]).slice(0, 100).map((thread) => ({ thread }));
-  }
-  const hits = JSON.parse(await atuin(["threads", "search", "--style", "json", "--limit", "40", "--", ...words])) as {
+  if (words.length === 0) return sessions.slice(0, 100).map((session) => ({ session, matches: [] }));
+  const hits = JSON.parse(await atuin(["threads", "search", "--style", "json", "--limit", "200", "--", ...words])) as {
     session: Thread;
     title: Snippet;
     preview: Snippet;
     message_index: number;
   }[];
-  // A title match has an empty preview; the matched message is the preview otherwise.
-  return hits.map((h) => ({
-    thread: h.session,
-    match: h.preview?.text ? h.preview : h.title?.text ? h.title : undefined,
-    messageIndex: h.message_index,
-  }));
+  const rows = new Map<string, Row>(); // insertion order = best hit first
+  for (const h of hits) {
+    const rootId = rootOf(h.session.atuin_id, parentOf);
+    const session = byId.get(rootId) ?? h.session;
+    const row = rows.get(rootId) ?? { session, matches: [] };
+    rows.set(rootId, row);
+    // A title match has an empty preview; the matched message is the preview otherwise.
+    const snippet = h.preview?.text ? h.preview : h.title;
+    if (snippet?.text) row.matches.push({ snippet, messageIndex: h.message_index, from: h.session });
+  }
+  return [...rows.values()].slice(0, 50);
 }
 
 /** Untitled sessions are mostly subagents; their opening brief is the best name they have. */
@@ -110,15 +136,20 @@ const clip = (s: string | null, n: number) => (s && s.length > n ? s.slice(0, n)
 /** Inline-code spans render as compact pills in Raycast's markdown -- the row's accessories, in the pane. */
 const pill = (s: string) => "`" + s.replace(/`/g, "'") + "`";
 
-function detailMarkdown(h: Hit, inAgentView: boolean): string {
-  const t = h.thread;
+const oneLine = (s: string) => s.replace(/\s+/g, " ").trim();
+
+function sessionMarkdown(r: Row, inAgentView: boolean): string {
+  const t = r.session;
   const where = [t.cwd.split("/").pop(), t.git_branch].filter(Boolean).join(" · ");
   const pills = [inAgentView ? "agent view" : "copy", machine(t), `${t.message_count} msgs`, ago(t.updated_at), where];
-  const parts: string[] = [pills.map(pill).join(" ")];
-  if (h.match) parts.push(`### Match${h.messageIndex !== undefined ? ` · message ${h.messageIndex}` : ""}\n\n${highlight(h.match)}`);
-  if (h.thread.preview) parts.push(`### Opening message\n\n${mdEscape(clip(h.thread.preview, 600))}`);
-  if (h.thread.last_reply) parts.push(`### Last reply\n\n${mdEscape(clip(h.thread.last_reply, 600))}`);
-  return parts.join("\n\n---\n\n") || "_no preview_";
+  const parts = [`# ${mdEscape(displayTitle(t))}`, pills.map(pill).join(" ")];
+  for (const m of r.matches) {
+    const src = m.from.atuin_id === t.atuin_id ? "session" : `subagent: ${displayTitle(m.from).replace(/^↳ /, "")}`;
+    parts.push(`### ${mdEscape(src)} · message ${m.messageIndex}\n\n${highlight(m.snippet)}`);
+  }
+  if (t.preview) parts.push(`### Opening message\n\n${mdEscape(clip(t.preview, 1200))}`);
+  if (t.last_reply) parts.push(`### Last reply\n\n${mdEscape(clip(t.last_reply, 1200))}`);
+  return parts.join("\n\n");
 }
 
 async function loadAgents(): Promise<Agent[]> {
@@ -198,44 +229,57 @@ async function pick(thread: Thread, agent: Agent | undefined, agents: Agent[]) {
   }
 }
 
+function SessionPage({ row, agent, agents }: { row: Row; agent?: Agent; agents: Agent[] }) {
+  return (
+    <Detail
+      markdown={sessionMarkdown(row, !!agent)}
+      actions={
+        <ActionPanel>
+          <Action
+            title={agent ? "Open in Pane 1 Agent View" : "Copy Resume Command"}
+            icon={agent ? Icon.Terminal : Icon.Clipboard}
+            onAction={() => pick(row.session, agent, agents)}
+          />
+          <Action.CopyToClipboard title="Copy Resume Command" content={resumeCommand(row.session)} />
+          <Action.CopyToClipboard title="Copy Claude Session ID" content={row.session.session_id} />
+        </ActionPanel>
+      }
+    />
+  );
+}
+
 export default function Command() {
   const [text, setText] = useState("");
-  const [detailPref, setDetailPref] = useState(true);
-  // The pane is for seeing WHY a search hit matched; with no search, the full-width list with pills reads better.
-  const showDetail = detailPref && text.trim().length > 0;
-  const threads = useCachedPromise(loadThreads, [text], { keepPreviousData: true });
+  const rows = useCachedPromise(loadRows, [text], { keepPreviousData: true });
   const agents = useCachedPromise(loadAgents, [], { keepPreviousData: true });
   const bySession = new Map((agents.data ?? []).map((a) => [a.sessionId, a]));
 
   return (
     <List
-      isLoading={threads.isLoading || agents.isLoading}
+      isLoading={rows.isLoading || agents.isLoading}
       filtering={false}
       throttle
       onSearchTextChange={setText}
       searchBarPlaceholder="Search past Claude sessions (Mac + Spark)…"
-      isShowingDetail={showDetail}
     >
-      {(threads.data ?? []).map((h) => {
-        const t = h.thread;
+      {(rows.data ?? []).map((r) => {
+        const t = r.session;
         const agent = bySession.get(t.session_id);
         const where = [t.cwd.split("/").pop(), t.git_branch].filter(Boolean).join(" · ");
+        const first = r.matches[0];
+        const extra = r.matches.length > 1 ? `  +${r.matches.length - 1}` : "";
         return (
           <List.Item
             key={t.atuin_id}
             title={displayTitle(t)}
-            subtitle={showDetail ? undefined : where}
-            detail={
-              <List.Item.Detail
-                markdown={detailMarkdown(h, !!agent)}
-              />
-            }
-            accessories={showDetail ? (agent ? [{ icon: { source: Icon.Dot, tintColor: Color.Green }, tooltip: "in the agent view" }] : []) : [
+            // While searching, the second column is what matched (⌘↵ shows all of it); otherwise where it ran.
+            subtitle={first ? oneLine(first.snippet.text).slice(0, 140) + extra : where}
+            accessories={[
               agent
                 ? { tag: { value: "agent view", color: Color.Green }, tooltip: `Opens in pane 1 (${agent.state})` }
                 : { tag: { value: "copy", color: Color.SecondaryText }, tooltip: "Not in the agent view: Enter copies atuin resume" },
-              { text: machine(t) },
-              { text: `${t.message_count}` , tooltip: "messages" },
+              { text: machine(t), tooltip: where },
+              { text: `${t.message_count}`, tooltip: "messages" },
               { text: ago(t.updated_at), tooltip: new Date(t.updated_at).toLocaleString() },
             ]}
             actions={
@@ -245,20 +289,20 @@ export default function Command() {
                   icon={agent ? Icon.Terminal : Icon.Clipboard}
                   onAction={() => pick(t, agent, agents.data ?? [])}
                 />
+                <Action.Push
+                  title="Show Matches"
+                  icon={Icon.Text}
+                  shortcut={{ modifiers: ["cmd"], key: "return" }}
+                  target={<SessionPage row={r} agent={agent} agents={agents.data ?? []} />}
+                />
                 <Action.CopyToClipboard title="Copy Resume Command" content={resumeCommand(t)} />
                 <Action.CopyToClipboard title="Copy Claude Session ID" content={t.session_id} />
-                <Action
-                  title={showDetail ? "Hide Preview" : "Show Preview"}
-                  icon={Icon.Sidebar}
-                  shortcut={{ modifiers: ["cmd"], key: "d" }}
-                  onAction={() => setDetailPref((v) => !v)}
-                />
                 <Action
                   title="Refresh"
                   icon={Icon.ArrowClockwise}
                   shortcut={{ modifiers: ["cmd"], key: "r" }}
                   onAction={() => {
-                    threads.revalidate();
+                    rows.revalidate();
                     agents.revalidate();
                   }}
                 />
