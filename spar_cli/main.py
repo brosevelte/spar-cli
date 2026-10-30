@@ -1207,7 +1207,7 @@ def sync_dotfiles() -> None:
 
 raycast_app = typer.Typer(
     no_args_is_help=True,
-    help="The Raycast extension in raycast/: jump to Claude, send it a message, open its agents view, start sessions, switch panes and repos -- all against the `spark layout` shape of the tmux session.",
+    help="The Raycast extension in raycast/: jump to Claude, open its agents view, start sessions, switch panes and repos -- all against the `spark layout` shape of the tmux session.",
 )
 app.add_typer(raycast_app, name="raycast")
 
@@ -1305,7 +1305,7 @@ def raycast_install() -> None:
     _register_raycast_extension()
     _run(["ssh", CTL_HOST, "true"], check=False)  # warm the control socket so the first Raycast call is fast
     typer.secho(
-        "Raycast extension 'Spark' installed. Commands: Go to Claude, Send to Claude, Claude Agents Page, Search Claude Agents, Search Claude Sessions, New Claude Session, Go to Shell Pane, Go to Repo. "
+        "Raycast extension 'Spark' installed. Commands: Go to Claude, Claude Agents Page, Search Claude Agents, Search Claude Sessions, New Claude Session, Go to Shell Pane, Go to Repo. "
         f"Its tmux session preference defaults to c1; set it to tmux_session ({c.tmux_session}) if they differ.",
         fg="green",
     )
