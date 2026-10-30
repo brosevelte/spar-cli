@@ -120,7 +120,7 @@ async function openInAgentView(agent: Agent, agents: Agent[]): Promise<void> {
   const rows = found
     .split("\n")
     .filter((l) => !l.includes(FIND_MARK) && l.toLowerCase().includes(head)).length;
-  const ready = /enter to (open|resume)/.test(found) && !found.includes("no sessions match");
+  const ready = /enter to (open|resume|return)/.test(found) && !found.includes("no sessions match");
   if (!ready || rows !== 1) {
     throw new Refused(`find shows ${rows} matching rows for "${name}"; left it open in pane 1 (Esc clears it)`);
   }
