@@ -219,21 +219,21 @@ If it hangs at `Authenticating... Trying none...`, that's Tailscale SSH's `check
 
 ## Raycast: driving the mosh → tmux session from the launcher
 
-`raycast/` is a small Raycast extension ("Spark") for getting at the persistent session without touching the keyboard chord for it. None of its commands are Ghostty operations: each is a tmux command on the box, plus one AppleScript call that brings the Ghostty tab running mosh to the front. tmux is what gives the layout names, so the extension depends on the `spark layout` shape — session `c1` (a preference), window `claude`, pane 1 Claude Code, pane 2 a shell.
+`raycast/` is a small Raycast extension ("Spark") for getting at the persistent session without touching the keyboard chord for it. None of its commands are Ghostty operations: each is a tmux command on the box, plus one AppleScript call that brings the Ghostty tab holding the Spark session to the front (matched by title, `[spark-` by default). tmux is what gives the layout names, so the extension depends on the `spark layout` shape — session `c1` (a preference), window `claude`, pane 1 Claude Code, pane 2 a shell.
 
 | command | what it does |
 |---|---|
 | Go to Claude | focus the mosh tab, select window `claude`, pane 1 |
-| Send to Claude `<message>` | type the message into pane 1 (`send-keys -l`) and press Enter, then focus. It goes to whatever pane 1 is showing: the chat in a running session; on a cold `claude` start in a repo that opens on the fleet view, it dispatches a background agent instead |
 | Claude Agents Page | press the agents-view key (↓, a preference) in pane 1 — Claude Code's own "↓ to manage" view |
 | Search Claude Agents | list from `claude agents --json --all` on the box, newest first, state and age as accessories. Enter opens the job in a new tmux window (`claude --resume <session>`); other actions open the agents page, copy the session id or the resume command |
-| New Claude Session | pick a repo under `~/src` on the box; new tmux window there running `claude` (or `claude --continue`, or just a shell) |
+| Search Claude Sessions | past Claude sessions from BOTH machines via atuin's synced thread capture, searched locally on the Mac (full text). A session the agent view lists opens in pane 1 through the view's own Ctrl+F find; anything else (Mac sessions, plain `claude` sessions) copies `atuin resume <id>`. Every keystroke is gated on re-reading the pane (`raycast/src/agentview.ts`): in the wrong mode, text + Enter dispatches a new session and Esc quits the view |
+| New Claude Session | bring pane 1 back to the agents list with an empty "describe a task for a new session" prompt and focus it. It types nothing: you write the task there, with `@` completions, and Enter dispatches it. Sessions start in the agent view's directory |
 | Go to Shell Pane | select pane 2 and focus |
 | Go to Repo | pick a repo; a literal `cd` typed into pane 2 (deterministic where `z fra` depends on frecency) |
 
 Setup is `spark raycast install`, then restart Ghostty once (the AppleScript flag only takes effect on launch). Latency is what makes this usable: the extension talks to the box through the `spark-ctl` alias, multiplexed over one persistent master connection (`ControlMaster auto`, 4h persist), so a command round-trips in ~40ms instead of a ~500ms handshake. The alias is separate from `Host spark` on purpose — Zed, Rune and mosh never share the socket. The remote login shell is fish, whose quoting isn't POSIX, so the extension never puts a script on ssh's command line: it pipes it to `bash -ls` on stdin.
 
-Preferences (Raycast → Extensions → Spark): ssh alias, tmux session (default `c1`), window (`claude`), Ghostty tab match (`[mosh]`), repos directory (`~/src`), agents-view key (`Down`). If your `tmux_session` in the spark config isn't `c1`, set the session preference to match.
+Preferences (Raycast → Extensions → Spark): ssh alias, tmux session (default `c1`), window (`claude`), Ghostty tab match (`[spark-`), repos directory (`~/src`), agents-view key (`Down`), atuin binary (`/opt/homebrew/bin/atuin`). If your `tmux_session` in the spark config isn't `c1`, set the session preference to match.
 
 ## Images: pasting screenshots into a remote Claude session
 
