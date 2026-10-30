@@ -29,6 +29,7 @@ export interface Prefs {
   tabMatch: string;
   srcDir: string;
   agentsKey: string;
+  atuinPath: string;
 }
 
 export const prefs = getPreferenceValues<Prefs>();

@@ -2,11 +2,13 @@
   "$schema": "https://www.raycast.com/schemas/extension.json",
   "name": "spark",
   "title": "Spark",
-  "description": "Drive the persistent mosh → tmux session on the Spark from Raycast: jump to Claude, send it a message, open its agents view, start sessions, switch panes and repos.",
+  "description": "Drive the persistent mosh \u2192 tmux session on the Spark from Raycast: jump to Claude, send it a message, open its agents view, start sessions, switch panes and repos.",
   "icon": "icon.png",
   "author": "cartertiernan",
   "license": "MIT",
-  "categories": ["Developer Tools"],
+  "categories": [
+    "Developer Tools"
+  ],
   "commands": [
     {
       "name": "goto-claude",
@@ -19,7 +21,14 @@
       "title": "Send to Claude",
       "description": "Type a message into the Claude pane on the Spark and submit it",
       "mode": "no-view",
-      "arguments": [{ "name": "message", "placeholder": "message", "type": "text", "required": true }]
+      "arguments": [
+        {
+          "name": "message",
+          "placeholder": "message",
+          "type": "text",
+          "required": true
+        }
+      ]
     },
     {
       "name": "agents-page",
@@ -31,6 +40,12 @@
       "name": "agents",
       "title": "Search Claude Agents",
       "description": "Search the background agents on the Spark; open one in a new tmux window",
+      "mode": "view"
+    },
+    {
+      "name": "sessions",
+      "title": "Search Claude Sessions",
+      "description": "Search past Claude sessions from the Mac and the Spark (atuin); open one in pane 1's agent view, or copy its resume command",
       "mode": "view"
     },
     {
@@ -99,6 +114,14 @@
       "description": "tmux key name that opens Claude Code's agents view when the prompt is empty",
       "type": "textfield",
       "default": "Down",
+      "required": false
+    },
+    {
+      "name": "atuinPath",
+      "title": "atuin binary",
+      "description": "Local atuin, used to search synced Claude sessions",
+      "type": "textfield",
+      "default": "/opt/homebrew/bin/atuin",
       "required": false
     }
   ],
