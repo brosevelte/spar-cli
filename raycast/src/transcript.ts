@@ -40,28 +40,18 @@ export async function loadMessages(atuinId: string): Promise<Message[]> {
 
 const blocks = (m: Message): Block[] => (Array.isArray(m.content) ? m.content : []);
 
-/** A message worth showing: a user/assistant turn with text or a tool call, or a tool result. */
-function visible(m: Message): boolean {
-  if (m.role === "user") return blocks(m).some((b) => b.type === "text" && b.text?.trim());
-  if (m.role === "assistant") return blocks(m).some((b) => (b.type === "text" && b.text?.trim()) || b.type === "tool_call");
-  if (m.role === "tool") return blocks(m).some((b) => b.type === "tool_result" || b.type === "patch");
-  return false;
-}
+const textOf = (m: Message): string =>
+  blocks(m)
+    .filter((b) => b.type === "text" && b.text?.trim())
+    .map((b) => b.text!.trim())
+    .join("\n\n");
+
+/** A conversation turn: your message or Claude's reply text. Tool calls, results and reasoning are not. */
+const isTurn = (m: Message) => (m.role === "user" || m.role === "assistant") && textOf(m).length > 0;
 
 // `$` would start a LaTeX span in Raycast's renderer (that was the red text); nothing else is escaped,
 // because Claude's text IS markdown and should render as such.
 const noMath = (s: string) => s.replace(/\$/g, "\\$");
-
-const clip = (s: string, chars: number, lines: number) => {
-  let out = s.split("\n").slice(0, lines).join("\n");
-  if (out.length > chars) out = out.slice(0, chars);
-  return out.length < s.length ? out + "\n…" : out;
-};
-
-function fence(body: string, lang = ""): string {
-  const ticks = body.includes("```") ? "````" : "```";
-  return `${ticks}${lang}\n${body}\n${ticks}`;
-}
 
 function bold(text: string, words: string[]): string {
   if (!words.length) return text;
@@ -69,50 +59,59 @@ function bold(text: string, words: string[]): string {
   return text.replace(re, "**$1**");
 }
 
-function toolCall(b: Block): string {
-  let input: Record<string, unknown> = {};
+/** One line per tool call -- what it was for, not the payload, so a turn never fills the window. */
+function toolLine(b: Block): string {
+  let desc = "";
   try {
-    input = JSON.parse(b.input ?? "{}");
+    const input = JSON.parse(b.input ?? "{}") as Record<string, unknown>;
+    const d = input.description ?? input.file_path ?? input.path ?? input.pattern ?? input.url;
+    if (typeof d === "string") desc = ` — ${noMath(d.length > 100 ? d.slice(0, 100) + "…" : d)}`;
   } catch {
-    // Not JSON (some harnesses store a plain string): show it as-is below.
-    return `**⚙ ${b.name ?? "tool"}**\n\n${fence(clip(b.input ?? "", 1500, 25))}`;
+    // Non-JSON input: the tool name alone is the collapsed form.
   }
-  const desc = typeof input.description === "string" ? ` — ${noMath(input.description)}` : "";
-  if (typeof input.command === "string") return `**⚙ ${b.name}**${desc}\n\n${fence(clip(input.command, 1500, 25), "sh")}`;
-  const path = input.file_path ?? input.path ?? input.pattern;
-  if (typeof path === "string" && Object.keys(input).length <= 3) return `**⚙ ${b.name}** \`${path}\`${desc}`;
-  return `**⚙ ${b.name}**${desc}\n\n${fence(clip(JSON.stringify(input, null, 2), 1500, 25), "json")}`;
+  return `\`⚙ ${b.name ?? "tool"}\`${desc}`;
+}
+
+/** Around a match a turn can be long: keep a window centred on the first word hit. */
+function windowed(text: string, words: string[], chars = 1800): string {
+  if (text.length <= chars || !words.length) return text;
+  const hits = words.map((w) => text.toLowerCase().indexOf(w.toLowerCase())).filter((i) => i >= 0);
+  const at = hits.length ? Math.min(...hits) : 0;
+  const start = Math.max(0, at - chars / 3);
+  return (start > 0 ? "…" : "") + text.slice(start, start + chars) + (start + chars < text.length ? "…" : "");
 }
 
 function render(m: Message, words: string[]): string {
+  const text = textOf(m);
   const out: string[] = [];
-  for (const b of blocks(m)) {
-    if (b.type === "text" && b.text?.trim()) {
-      const t = bold(noMath(clip(b.text.trim(), 2500, 60)), words);
-      out.push(m.role === "user" ? `**You**\n\n${t.split("\n").map((l) => "> " + l).join("\n")}` : `**Claude**\n\n${t}`);
-    } else if (b.type === "tool_call") {
-      out.push(toolCall(b));
-    } else if (b.type === "tool_result") {
-      const err = b.is_error === "True" ? " (error)" : "";
-      out.push(`*↳ result${err}*\n\n${fence(clip(b.content ?? "", 1200, 15))}`);
-    } else if (b.type === "patch") {
-      out.push(`*↳ edited files*`);
-    }
+  if (text) {
+    const t = bold(noMath(windowed(text, words)), words);
+    out.push(m.role === "user" ? `**You**\n\n${t.split("\n").map((l) => "> " + l).join("\n")}` : `**Claude**\n\n${t}`);
   }
+  const tools = blocks(m).filter((b) => b.type === "tool_call");
+  if (tools.length) out.push(tools.map(toolLine).join("  \n"));
   return out.join("\n\n");
 }
 
-/** The matched message with one visible message of context either side. */
-export function renderAround(msgs: Message[], index: number, words: string[]): string {
-  const before: number[] = [];
-  for (let i = index - 1; i >= 0 && before.length < 1; i--) if (visible(msgs[i])) before.push(i);
-  const after: number[] = [];
-  for (let i = index + 1; i < msgs.length && after.length < 1; i++) if (visible(msgs[i])) after.push(i);
-  const dim = (i: number) => render(msgs[i], []);
-  const parts = [
-    ...before.reverse().map(dim),
-    msgs[index] ? render(msgs[index], words) : "_message not found_",
-    ...after.map(dim),
-  ].filter(Boolean);
-  return parts.join("\n\n");
+/**
+ * The matched message with one conversation turn of context either side (tool traffic skipped). A match
+ * that sits in a tool call shows collapsed: the call's one line plus atuin's short highlighted extract
+ * (`matchMd`), never the full command and output.
+ */
+export function renderAround(msgs: Message[], index: number, words: string[], matchMd: string): string {
+  let prev = -1;
+  for (let i = index - 1; i >= 0; i--) if (isTurn(msgs[i])) { prev = i; break; }
+  let next = -1;
+  for (let i = index + 1; i < msgs.length; i++) if (isTurn(msgs[i])) { next = i; break; }
+  const m = msgs[index];
+  let hit: string;
+  if (!m) hit = "_message not found_";
+  else if (isTurn(m)) hit = render(m, words);
+  else {
+    const head = render(m, []) || (m.role === "tool" ? "`↳ tool result`" : `\`${m.role}\``);
+    let extract = matchMd.length > 400 ? matchMd.slice(0, 400) + "…" : matchMd;
+    if ((extract.match(/\*\*/g) ?? []).length % 2) extract += "**"; // don't leave a cut-off bold open
+    hit = `${head}\n\n> ${extract}`;
+  }
+  return [prev >= 0 ? render(msgs[prev], []) : "", hit, next >= 0 ? render(msgs[next], []) : ""].filter(Boolean).join("\n\n");
 }

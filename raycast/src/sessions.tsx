@@ -94,8 +94,7 @@ async function loadRows(text: string): Promise<Row[]> {
   const rows = new Map<string, Row>(); // insertion order = best hit first
   for (const h of hits) {
     const rootId = rootOf(h.session.atuin_id, parentOf);
-    const session = byId.get(rootId) ?? h.session;
-    const row = rows.get(rootId) ?? { session, matches: [] };
+    const row = rows.get(rootId) ?? { session: byId.get(rootId) ?? h.session, matches: [] };
     rows.set(rootId, row);
     // A title match has an empty preview; the matched message is the preview otherwise.
     const snippet = h.preview?.text ? h.preview : h.title;
@@ -154,7 +153,7 @@ async function sessionMarkdown(r: Row, inAgentView: boolean, words: string[]): P
   for (const m of r.matches.slice(0, MAX_MATCHES)) {
     const src = m.from.atuin_id === t.atuin_id ? "in the session" : `in subagent: ${displayTitle(m.from).replace(/^↳ /, "")}`;
     const msgs = await loadMessages(m.from.atuin_id);
-    parts.push(`---\n\n#### Match ${mdEscape(src)} · message ${m.messageIndex}\n\n${renderAround(msgs, m.messageIndex, words)}`);
+    parts.push(`---\n\n#### Match ${mdEscape(src)} · message ${m.messageIndex}\n\n${renderAround(msgs, m.messageIndex, words, highlight(m.snippet))}`);
   }
   if (r.matches.length > MAX_MATCHES) parts.push(`---\n\n_${r.matches.length - MAX_MATCHES} more matches not shown_`);
   if (!r.matches.length && t.last_reply) parts.push(`---\n\n**Last reply**\n\n${t.last_reply}`);
@@ -284,7 +283,7 @@ export default function Command() {
             key={t.atuin_id}
             title={displayTitle(t)}
             // While searching, the second column is what matched (⌘↵ shows all of it); otherwise where it ran.
-            subtitle={first ? oneLine(first.snippet.text).slice(0, 140) + extra : where}
+            subtitle={first ? oneLine(first.snippet.text).slice(0, 160) + extra : where}
             accessories={[
               agent
                 ? { tag: { value: "agent view", color: Color.Green }, tooltip: `Opens in pane 1 (${agent.state})` }
