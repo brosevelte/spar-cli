@@ -89,9 +89,25 @@ async function openInAgentView(agent: Agent, agents: Agent[]): Promise<void> {
   const t = q(pane(1));
   await tmux(`select-window -t ${q(`${prefs.session}:${prefs.window}`)}`, `select-pane -t ${t}`);
 
-  const before = await capture();
-  if (!before.includes(PROMPT_EMPTY)) throw new Refused("pane 1 isn't showing the agents list with an empty prompt");
-  if (before.includes(FIND_MARK)) throw new Refused("pane 1 already has a find open; clear it with Esc first");
+  // Bring pane 1 to "agents list, empty prompt, no find" from whatever it shows, one verified key at a
+  // time (at most 3 steps). Only two keys are ever used here, each only in the state where it is proven
+  // harmless: Esc while the footer says "esc to clear" (a find is open -- the agent view also restores
+  // its last find on startup), and Left from inside a session whose prompt is empty ("← N agents").
+  // Anything else refuses. Never Esc outside a find: there it QUITS the agent view.
+  for (let step = 0; ; step++) {
+    const screen = await capture();
+    const findOpen = screen.includes(FIND_MARK) && screen.includes("esc to clear");
+    if (!findOpen && screen.includes(PROMPT_EMPTY)) break;
+    if (step >= 3) throw new Refused("couldn't bring pane 1 back to the agents list");
+    if (findOpen) {
+      await tmux(`send-keys -t ${t} Escape`);
+    } else if (/←\s*\d*\s*agents?/.test(screen) && screen.split("\n").some((l) => /^❯\s*$/.test(l))) {
+      await tmux(`send-keys -t ${t} Left`);
+    } else {
+      throw new Refused("pane 1 is neither the agents list nor a session with an empty prompt");
+    }
+    await sleep(700);
+  }
 
   await tmux(`send-keys -t ${t} C-f`);
   await sleep(400);
