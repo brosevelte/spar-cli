@@ -57,29 +57,42 @@ export async function tmux(...cmds: string[]): Promise<string> {
   return ssh(cmds.map((c) => `tmux ${c}`).join(" && "));
 }
 
-/** Bring the Ghostty tab running the mosh session to the front. Needs `macos-applescript = true`. */
+/**
+ * Bring the Ghostty tab running the Spark session to the front. Needs `macos-applescript = true`.
+ * Matches tabs whose title contains `tabMatch` (the remote shell titles them `[spark-d4d5] ...`); when
+ * several do (a plain ssh tab too), prefers the one whose title names the layout's tmux session.
+ * No match is an error, not a silent no-op: the command must not report success on the wrong tab.
+ */
 export async function focusGhostty(): Promise<void> {
-  const match = prefs.tabMatch.replace(/"/g, '\\"');
+  const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const match = esc(prefs.tabMatch);
+  const preferred = esc(`-s ${prefs.session}`);
   const script = `
 tell application "Ghostty"
-  activate
+  set best to missing value
+  set bestWin to missing value
   repeat with w in windows
     repeat with t in tabs of w
-      if (name of t) contains "${match}" then
-        select tab t
-        activate window w
-        focus (focused terminal of t)
-        return "ok"
+      set n to name of t
+      if n contains "${match}" then
+        if best is missing value or n contains "${preferred}" then
+          set best to t
+          set bestWin to w
+        end if
       end if
     end repeat
   end repeat
-end tell
-return "none"`;
-  try {
-    await run("/usr/bin/osascript", ["-e", script]);
-  } catch {
-    // AppleScript off or Ghostty not scriptable yet: at least raise the app.
+  if best is missing value then return "none"
+  activate
+  select tab best
+  activate window bestWin
+  focus (focused terminal of best)
+  return "ok"
+end tell`;
+  const { stdout } = await run("/usr/bin/osascript", ["-e", script]);
+  if (stdout.trim() !== "ok") {
     await run("/usr/bin/open", ["-a", "Ghostty"]);
+    throw new Error(`no Ghostty tab title contains "${prefs.tabMatch}" (set the Ghostty tab match preference)`);
   }
 }
 

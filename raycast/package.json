@@ -95,9 +95,9 @@
     {
       "name": "tabMatch",
       "title": "Ghostty tab match",
-      "description": "Substring of the Ghostty tab title that holds the mosh session",
+      "description": "Substring of the Ghostty tab title that holds the Spark session (the remote shell titles it [<hostname>] ...)",
       "type": "textfield",
-      "default": "[mosh]",
+      "default": "[spark-",
       "required": false
     },
     {
