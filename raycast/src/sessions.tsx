@@ -3,7 +3,8 @@ import { useCachedPromise } from "@raycast/utils";
 import { execFile } from "node:child_process";
 import { useState } from "react";
 import { promisify } from "node:util";
-import { focusGhostty, pane, prefs, q, ssh, tmux } from "./spark";
+import { focusGhostty, prefs, q, ssh, tmux } from "./spark";
+import { FIND_MARK, Refused, paneTarget, settle, toAgentsList } from "./agentview";
 
 const run = promisify(execFile);
 
@@ -15,10 +16,7 @@ const run = promisify(execFile);
 // plain `claude` sessions -- just copies `atuin resume <id>`; this command never opens windows or
 // touches the layout for those (ruling 2026-10-30).
 //
-// The agent view is driven by keystrokes, and a keystroke in the wrong mode is not harmless: text +
-// Enter in the new-task prompt DISPATCHES A NEW SESSION, and Esc with no find active QUITS the view.
-// So every step re-reads the pane and stops (sending nothing more) the moment it doesn't look exactly
-// as expected. Never add a blind Escape/Enter here.
+// Keystroke safety rules for the agent view live in agentview.ts.
 
 interface Thread {
   atuin_id: string;
@@ -36,9 +34,6 @@ interface Agent {
   name: string;
   state: string;
 }
-
-const PROMPT_EMPTY = "describe a task for a new session";
-const FIND_MARK = "⌕";
 
 async function atuin(args: string[]): Promise<string> {
   const { stdout } = await run(prefs.atuinPath, args, {
@@ -73,21 +68,6 @@ function ago(iso: string): string {
 
 const machine = (t: Thread) => (t.cwd.startsWith("/Users/") ? "Mac" : "Spark");
 const resumeCommand = (t: Thread) => `atuin resume ${t.atuin_id}`;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const capture = () => tmux(`capture-pane -p -t ${q(pane(1))}`);
-
-/** Re-read pane 1 every 80ms (one ~40ms round trip each) until `ok` holds; returns the last screen either way. */
-async function settle(ok: (screen: string) => boolean, timeoutMs = 1500): Promise<string> {
-  const until = Date.now() + timeoutMs;
-  for (;;) {
-    const screen = await capture();
-    if (ok(screen) || Date.now() >= until) return screen;
-    await sleep(80);
-  }
-}
-
-class Refused extends Error {}
-
 /** Open `agent` in pane 1's agent view via Ctrl+F find, verifying the pane before every keystroke. */
 async function openInAgentView(agent: Agent, agents: Agent[]): Promise<void> {
   const name = agent.name.trim();
@@ -96,7 +76,7 @@ async function openInAgentView(agent: Agent, agents: Agent[]): Promise<void> {
   const clashes = agents.filter((a) => a.name.toLowerCase().includes(needle)).length;
   if (clashes !== 1) throw new Refused(`${clashes} sessions match "${name}" in the agent view; pick it there`);
 
-  const t = q(pane(1));
+  const t = paneTarget();
   await tmux(`select-window -t ${q(`${prefs.session}:${prefs.window}`)}`, `select-pane -t ${t}`);
   // Raise the tab now, not at the end: the keystrokes below take a few hundred ms and are worth watching.
   const [drove, focused] = await Promise.allSettled([drivePane(t, name, needle), focusGhostty()]);
@@ -111,21 +91,7 @@ async function drivePane(t: string, name: string, needle: string): Promise<void>
   // harmless: Esc while the footer says "esc to clear" (a find is open -- the agent view also restores
   // its last find on startup), and Left from inside a session whose prompt is empty ("← N agents").
   // Anything else refuses. Never Esc outside a find: there it QUITS the agent view.
-  const findOpen = (sc: string) => sc.includes(FIND_MARK) && sc.includes("esc to clear");
-  let screen = await capture();
-  for (let step = 0; findOpen(screen) || !screen.includes(PROMPT_EMPTY); step++) {
-    if (step >= 3) throw new Refused("couldn't bring pane 1 back to the agents list");
-    if (findOpen(screen)) {
-      await tmux(`send-keys -t ${t} Escape`);
-      screen = await settle((sc) => !findOpen(sc));
-    } else if (/←\s*\d*\s*agents?/.test(screen) && screen.split("\n").some((l) => /^❯\s*$/.test(l))) {
-      await tmux(`send-keys -t ${t} Left`);
-      // Back on the list, possibly with the agent view's restored find open (the next pass clears it).
-      screen = await settle((sc) => sc.includes(PROMPT_EMPTY) || findOpen(sc));
-    } else {
-      throw new Refused("pane 1 is neither the agents list nor a session with an empty prompt");
-    }
-  }
+  await toAgentsList();
 
   await tmux(`send-keys -t ${t} C-f`);
   if (!(await settle((sc) => sc.includes(FIND_MARK))).includes(FIND_MARK)) throw new Refused("Ctrl+F didn't open find in pane 1; nothing was typed");

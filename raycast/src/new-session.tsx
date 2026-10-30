@@ -1,36 +1,27 @@
-import { Action, ActionPanel, Icon, List, closeMainWindow, showHUD, showToast, Toast } from "@raycast/api";
-import { useCachedPromise } from "@raycast/utils";
-import { focusGhostty, listRepos, newWindow, repoPath } from "./spark";
+import { closeMainWindow, showHUD, showToast, Toast } from "@raycast/api";
+import { focusGhostty, prefs, q, tmux } from "./spark";
+import { Refused, paneTarget, toAgentsList } from "./agentview";
 
-async function start(repo: string, cmd: string) {
-  try {
-    await closeMainWindow({ clearRootSearch: true });
-    await newWindow(repo, repoPath(repo), cmd);
-    await focusGhostty();
-    await showHUD(`${cmd} in ${repo}`);
-  } catch (e) {
-    await showToast({ style: Toast.Style.Failure, title: "Start failed", message: String(e) });
+// Every session goes through pane 1's agent view (ruling 2026-10-30). This only takes you there: the
+// Spark tab, pane 1, back on the agents list with an empty "describe a task for a new session" prompt.
+// It never types or presses Enter -- you write the task in the real prompt, where @-completion works,
+// and dispatch it yourself. Sessions start in the agent view's directory (~/src/ultron-framework).
+export default async function Command() {
+  await closeMainWindow({ clearRootSearch: true });
+  await tmux(`select-window -t ${q(`${prefs.session}:${prefs.window}`)}`, `select-pane -t ${paneTarget()}`);
+  const [ready, focused] = await Promise.allSettled([toAgentsList(), focusGhostty()]);
+  if (ready.status === "rejected") {
+    const e = ready.reason;
+    await showToast({
+      style: Toast.Style.Failure,
+      title: "Couldn't reach the new-task prompt",
+      message: e instanceof Refused ? e.message : String(e),
+    });
+    return;
   }
-}
-
-export default function Command() {
-  const { data, isLoading } = useCachedPromise(listRepos, [], { keepPreviousData: true });
-  return (
-    <List isLoading={isLoading} searchBarPlaceholder="Start Claude in…">
-      {(data ?? []).map((repo) => (
-        <List.Item
-          key={repo}
-          title={repo}
-          icon={Icon.Folder}
-          actions={
-            <ActionPanel>
-              <Action title="New Claude Session" icon={Icon.Terminal} onAction={() => start(repo, "claude")} />
-              <Action title="Continue Last Session Here" icon={Icon.Redo} onAction={() => start(repo, "claude --continue")} />
-              <Action title="New Shell Window" icon={Icon.Window} onAction={() => start(repo, "clear")} />
-            </ActionPanel>
-          }
-        />
-      ))}
-    </List>
-  );
+  if (focused.status === "rejected") {
+    await showToast({ style: Toast.Style.Failure, title: "Couldn't focus the Spark tab", message: String(focused.reason) });
+    return;
+  }
+  await showHUD("New session: type the task in pane 1");
 }

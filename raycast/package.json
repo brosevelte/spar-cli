@@ -51,8 +51,8 @@
     {
       "name": "new-session",
       "title": "New Claude Session",
-      "description": "Start a Claude session in a repo, in a new tmux window",
-      "mode": "view"
+      "description": "Go to pane 1's agent view with an empty new-task prompt (type the task there, with @ completions)",
+      "mode": "no-view"
     },
     {
       "name": "second-pane",
