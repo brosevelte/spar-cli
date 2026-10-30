@@ -26,6 +26,20 @@ interface Thread {
   updated_at: string;
   message_count: number;
   title: string | null;
+  preview: string | null; // the session's opening message
+  last_reply: string | null;
+}
+
+interface Snippet {
+  text: string;
+  matches?: [number, number][];
+}
+
+/** A row: the session, plus (for a search) the message that matched and where. */
+interface Hit {
+  thread: Thread;
+  match?: Snippet;
+  messageIndex?: number;
 }
 
 interface Agent {
@@ -44,15 +58,61 @@ async function atuin(args: string[]): Promise<string> {
   return stdout;
 }
 
-async function loadThreads(text: string): Promise<Thread[]> {
+async function loadThreads(text: string): Promise<Hit[]> {
   const words = text.trim().split(/\s+/).filter(Boolean);
   if (words.length === 0) {
-    return (JSON.parse(await atuin(["threads", "list", "--style", "json"])) as Thread[]).slice(0, 100);
+    return (JSON.parse(await atuin(["threads", "list", "--style", "json"])) as Thread[]).slice(0, 100).map((thread) => ({ thread }));
   }
   const hits = JSON.parse(await atuin(["threads", "search", "--style", "json", "--limit", "40", "--", ...words])) as {
     session: Thread;
+    title: Snippet;
+    preview: Snippet;
+    message_index: number;
   }[];
-  return hits.map((h) => h.session);
+  // A title match has an empty preview; the matched message is the preview otherwise.
+  return hits.map((h) => ({
+    thread: h.session,
+    match: h.preview?.text ? h.preview : h.title?.text ? h.title : undefined,
+    messageIndex: h.message_index,
+  }));
+}
+
+/** Untitled sessions are mostly subagents; their opening brief is the best name they have. */
+function displayTitle(t: Thread): string {
+  if (t.title) return t.title;
+  const line = (t.preview ?? "")
+    .split("\n")
+    .map((l) => l.replace(/<\/?[a-z_]+>/gi, "").trim())
+    .find((l) => l.length > 0);
+  return line ? `↳ ${line.slice(0, 80)}` : "untitled";
+}
+
+const MD_SPECIAL = /[\\`*_{}[\]()#+\-.!|<>~]/g;
+const mdEscape = (s: string) => s.replace(MD_SPECIAL, (c) => "\\" + c);
+
+/** Markdown for a snippet with its matched ranges in bold. atuin's ranges are UTF-8 BYTE offsets. */
+function highlight(sn: Snippet): string {
+  const bytes = Buffer.from(sn.text, "utf8");
+  const part = (a: number, b?: number) => mdEscape(bytes.subarray(a, b).toString("utf8"));
+  const ranges = [...(sn.matches ?? [])].sort((x, y) => x[0] - y[0]);
+  let out = "";
+  let at = 0;
+  for (const [a, b] of ranges) {
+    if (a < at) continue;
+    out += part(at, a) + "**" + part(a, b) + "**";
+    at = b;
+  }
+  return out + part(at);
+}
+
+const clip = (s: string | null, n: number) => (s && s.length > n ? s.slice(0, n) + "…" : s ?? "");
+
+function detailMarkdown(h: Hit): string {
+  const parts: string[] = [];
+  if (h.match) parts.push(`### Match${h.messageIndex !== undefined ? ` · message ${h.messageIndex}` : ""}\n\n${highlight(h.match)}`);
+  if (h.thread.preview) parts.push(`### Opening message\n\n${mdEscape(clip(h.thread.preview, 600))}`);
+  if (h.thread.last_reply) parts.push(`### Last reply\n\n${mdEscape(clip(h.thread.last_reply, 600))}`);
+  return parts.join("\n\n---\n\n") || "_no preview_";
 }
 
 async function loadAgents(): Promise<Agent[]> {
@@ -134,6 +194,7 @@ async function pick(thread: Thread, agent: Agent | undefined, agents: Agent[]) {
 
 export default function Command() {
   const [text, setText] = useState("");
+  const [showDetail, setShowDetail] = useState(true);
   const threads = useCachedPromise(loadThreads, [text], { keepPreviousData: true });
   const agents = useCachedPromise(loadAgents, [], { keepPreviousData: true });
   const bySession = new Map((agents.data ?? []).map((a) => [a.sessionId, a]));
@@ -145,15 +206,37 @@ export default function Command() {
       throttle
       onSearchTextChange={setText}
       searchBarPlaceholder="Search past Claude sessions (Mac + Spark)…"
+      isShowingDetail={showDetail}
     >
-      {(threads.data ?? []).map((t) => {
+      {(threads.data ?? []).map((h) => {
+        const t = h.thread;
         const agent = bySession.get(t.session_id);
+        const where = [t.cwd.split("/").pop(), t.git_branch].filter(Boolean).join(" · ");
         return (
           <List.Item
             key={t.atuin_id}
-            title={t.title || "untitled"}
-            subtitle={[t.cwd.split("/").pop(), t.git_branch].filter(Boolean).join(" · ")}
-            accessories={[
+            title={displayTitle(t)}
+            subtitle={showDetail ? undefined : where}
+            detail={
+              <List.Item.Detail
+                markdown={detailMarkdown(h)}
+                metadata={
+                  <List.Item.Detail.Metadata>
+                    <List.Item.Detail.Metadata.Label title="Where" text={where} />
+                    <List.Item.Detail.Metadata.Label title="Machine" text={machine(t)} />
+                    <List.Item.Detail.Metadata.Label title="Messages" text={`${t.message_count}`} />
+                    <List.Item.Detail.Metadata.Label title="Updated" text={new Date(t.updated_at).toLocaleString()} />
+                    <List.Item.Detail.Metadata.TagList title="Enter">
+                      <List.Item.Detail.Metadata.TagList.Item
+                        text={agent ? "opens in agent view" : "copies atuin resume"}
+                        color={agent ? Color.Green : Color.SecondaryText}
+                      />
+                    </List.Item.Detail.Metadata.TagList>
+                  </List.Item.Detail.Metadata>
+                }
+              />
+            }
+            accessories={showDetail ? (agent ? [{ icon: { source: Icon.Dot, tintColor: Color.Green }, tooltip: "in the agent view" }] : []) : [
               agent
                 ? { tag: { value: "agent view", color: Color.Green }, tooltip: `Opens in pane 1 (${agent.state})` }
                 : { tag: { value: "copy", color: Color.SecondaryText }, tooltip: "Not in the agent view: Enter copies atuin resume" },
@@ -170,6 +253,12 @@ export default function Command() {
                 />
                 <Action.CopyToClipboard title="Copy Resume Command" content={resumeCommand(t)} />
                 <Action.CopyToClipboard title="Copy Claude Session ID" content={t.session_id} />
+                <Action
+                  title={showDetail ? "Hide Preview" : "Show Preview"}
+                  icon={Icon.Sidebar}
+                  shortcut={{ modifiers: ["cmd"], key: "d" }}
+                  onAction={() => setShowDetail((v) => !v)}
+                />
                 <Action
                   title="Refresh"
                   icon={Icon.ArrowClockwise}
