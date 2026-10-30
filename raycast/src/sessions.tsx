@@ -107,8 +107,14 @@ function highlight(sn: Snippet): string {
 
 const clip = (s: string | null, n: number) => (s && s.length > n ? s.slice(0, n) + "…" : s ?? "");
 
-function detailMarkdown(h: Hit): string {
-  const parts: string[] = [];
+/** Inline-code spans render as compact pills in Raycast's markdown -- the row's accessories, in the pane. */
+const pill = (s: string) => "`" + s.replace(/`/g, "'") + "`";
+
+function detailMarkdown(h: Hit, inAgentView: boolean): string {
+  const t = h.thread;
+  const where = [t.cwd.split("/").pop(), t.git_branch].filter(Boolean).join(" · ");
+  const pills = [inAgentView ? "agent view" : "copy", machine(t), `${t.message_count} msgs`, ago(t.updated_at), where];
+  const parts: string[] = [pills.map(pill).join(" ")];
   if (h.match) parts.push(`### Match${h.messageIndex !== undefined ? ` · message ${h.messageIndex}` : ""}\n\n${highlight(h.match)}`);
   if (h.thread.preview) parts.push(`### Opening message\n\n${mdEscape(clip(h.thread.preview, 600))}`);
   if (h.thread.last_reply) parts.push(`### Last reply\n\n${mdEscape(clip(h.thread.last_reply, 600))}`);
@@ -194,7 +200,9 @@ async function pick(thread: Thread, agent: Agent | undefined, agents: Agent[]) {
 
 export default function Command() {
   const [text, setText] = useState("");
-  const [showDetail, setShowDetail] = useState(true);
+  const [detailPref, setDetailPref] = useState(true);
+  // The pane is for seeing WHY a search hit matched; with no search, the full-width list with pills reads better.
+  const showDetail = detailPref && text.trim().length > 0;
   const threads = useCachedPromise(loadThreads, [text], { keepPreviousData: true });
   const agents = useCachedPromise(loadAgents, [], { keepPreviousData: true });
   const bySession = new Map((agents.data ?? []).map((a) => [a.sessionId, a]));
@@ -219,21 +227,7 @@ export default function Command() {
             subtitle={showDetail ? undefined : where}
             detail={
               <List.Item.Detail
-                markdown={detailMarkdown(h)}
-                metadata={
-                  <List.Item.Detail.Metadata>
-                    <List.Item.Detail.Metadata.Label title="Where" text={where} />
-                    <List.Item.Detail.Metadata.Label title="Machine" text={machine(t)} />
-                    <List.Item.Detail.Metadata.Label title="Messages" text={`${t.message_count}`} />
-                    <List.Item.Detail.Metadata.Label title="Updated" text={new Date(t.updated_at).toLocaleString()} />
-                    <List.Item.Detail.Metadata.TagList title="Enter">
-                      <List.Item.Detail.Metadata.TagList.Item
-                        text={agent ? "opens in agent view" : "copies atuin resume"}
-                        color={agent ? Color.Green : Color.SecondaryText}
-                      />
-                    </List.Item.Detail.Metadata.TagList>
-                  </List.Item.Detail.Metadata>
-                }
+                markdown={detailMarkdown(h, !!agent)}
               />
             }
             accessories={showDetail ? (agent ? [{ icon: { source: Icon.Dot, tintColor: Color.Green }, tooltip: "in the agent view" }] : []) : [
@@ -257,7 +251,7 @@ export default function Command() {
                   title={showDetail ? "Hide Preview" : "Show Preview"}
                   icon={Icon.Sidebar}
                   shortcut={{ modifiers: ["cmd"], key: "d" }}
-                  onAction={() => setShowDetail((v) => !v)}
+                  onAction={() => setDetailPref((v) => !v)}
                 />
                 <Action
                   title="Refresh"
