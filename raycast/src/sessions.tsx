@@ -5,6 +5,7 @@ import { useState } from "react";
 import { promisify } from "node:util";
 import { focusGhostty, prefs, q, ssh, tmux } from "./spark";
 import { FIND_MARK, Refused, paneTarget, settle, toAgentsList } from "./agentview";
+import { loadMessages, renderAround } from "./transcript";
 
 const run = promisify(execFile);
 
@@ -138,17 +139,25 @@ const pill = (s: string) => "`" + s.replace(/`/g, "'") + "`";
 
 const oneLine = (s: string) => s.replace(/\s+/g, " ").trim();
 
-function sessionMarkdown(r: Row, inAgentView: boolean): string {
+function sessionHeader(r: Row, inAgentView: boolean): string {
   const t = r.session;
   const where = [t.cwd.split("/").pop(), t.git_branch].filter(Boolean).join(" · ");
   const pills = [inAgentView ? "agent view" : "copy", machine(t), `${t.message_count} msgs`, ago(t.updated_at), where];
-  const parts = [`# ${mdEscape(displayTitle(t))}`, pills.map(pill).join(" ")];
-  for (const m of r.matches) {
-    const src = m.from.atuin_id === t.atuin_id ? "session" : `subagent: ${displayTitle(m.from).replace(/^↳ /, "")}`;
-    parts.push(`### ${mdEscape(src)} · message ${m.messageIndex}\n\n${highlight(m.snippet)}`);
+  return `# ${mdEscape(displayTitle(t))}\n\n${pills.map(pill).join(" ")}`;
+}
+
+const MAX_MATCHES = 8;
+
+async function sessionMarkdown(r: Row, inAgentView: boolean, words: string[]): Promise<string> {
+  const t = r.session;
+  const parts = [sessionHeader(r, inAgentView)];
+  for (const m of r.matches.slice(0, MAX_MATCHES)) {
+    const src = m.from.atuin_id === t.atuin_id ? "in the session" : `in subagent: ${displayTitle(m.from).replace(/^↳ /, "")}`;
+    const msgs = await loadMessages(m.from.atuin_id);
+    parts.push(`---\n\n#### Match ${mdEscape(src)} · message ${m.messageIndex}\n\n${renderAround(msgs, m.messageIndex, words)}`);
   }
-  if (t.preview) parts.push(`### Opening message\n\n${mdEscape(clip(t.preview, 1200))}`);
-  if (t.last_reply) parts.push(`### Last reply\n\n${mdEscape(clip(t.last_reply, 1200))}`);
+  if (r.matches.length > MAX_MATCHES) parts.push(`---\n\n_${r.matches.length - MAX_MATCHES} more matches not shown_`);
+  if (!r.matches.length && t.last_reply) parts.push(`---\n\n**Last reply**\n\n${t.last_reply}`);
   return parts.join("\n\n");
 }
 
@@ -229,10 +238,12 @@ async function pick(thread: Thread, agent: Agent | undefined, agents: Agent[]) {
   }
 }
 
-function SessionPage({ row, agent, agents }: { row: Row; agent?: Agent; agents: Agent[] }) {
+function SessionPage({ row, agent, agents, words }: { row: Row; agent?: Agent; agents: Agent[]; words: string[] }) {
+  const md = useCachedPromise(sessionMarkdown, [row, !!agent, words]);
   return (
     <Detail
-      markdown={sessionMarkdown(row, !!agent)}
+      isLoading={md.isLoading}
+      markdown={md.data ?? (md.error ? `${sessionHeader(row, !!agent)}\n\n**Couldn't load messages:** ${String(md.error)}` : sessionHeader(row, !!agent))}
       actions={
         <ActionPanel>
           <Action
@@ -293,7 +304,7 @@ export default function Command() {
                   title="Show Matches"
                   icon={Icon.Text}
                   shortcut={{ modifiers: ["cmd"], key: "return" }}
-                  target={<SessionPage row={r} agent={agent} agents={agents.data ?? []} />}
+                  target={<SessionPage row={r} agent={agent} agents={agents.data ?? []} words={text.trim().split(/\s+/).filter(Boolean)} />}
                 />
                 <Action.CopyToClipboard title="Copy Resume Command" content={resumeCommand(t)} />
                 <Action.CopyToClipboard title="Copy Claude Session ID" content={t.session_id} />
