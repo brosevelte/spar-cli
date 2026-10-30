@@ -76,6 +76,16 @@ const resumeCommand = (t: Thread) => `atuin resume ${t.atuin_id}`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const capture = () => tmux(`capture-pane -p -t ${q(pane(1))}`);
 
+/** Re-read pane 1 every 80ms (one ~40ms round trip each) until `ok` holds; returns the last screen either way. */
+async function settle(ok: (screen: string) => boolean, timeoutMs = 1500): Promise<string> {
+  const until = Date.now() + timeoutMs;
+  for (;;) {
+    const screen = await capture();
+    if (ok(screen) || Date.now() >= until) return screen;
+    await sleep(80);
+  }
+}
+
 class Refused extends Error {}
 
 /** Open `agent` in pane 1's agent view via Ctrl+F find, verifying the pane before every keystroke. */
@@ -88,45 +98,55 @@ async function openInAgentView(agent: Agent, agents: Agent[]): Promise<void> {
 
   const t = q(pane(1));
   await tmux(`select-window -t ${q(`${prefs.session}:${prefs.window}`)}`, `select-pane -t ${t}`);
+  // Raise the tab now, not at the end: the keystrokes below take a few hundred ms and are worth watching.
+  const [drove, focused] = await Promise.allSettled([drivePane(t, name, needle), focusGhostty()]);
+  if (drove.status === "rejected") throw drove.reason; // the pane outcome is what the user asked about
+  if (focused.status === "rejected") throw focused.reason;
+}
+
+async function drivePane(t: string, name: string, needle: string): Promise<void> {
 
   // Bring pane 1 to "agents list, empty prompt, no find" from whatever it shows, one verified key at a
   // time (at most 3 steps). Only two keys are ever used here, each only in the state where it is proven
   // harmless: Esc while the footer says "esc to clear" (a find is open -- the agent view also restores
   // its last find on startup), and Left from inside a session whose prompt is empty ("← N agents").
   // Anything else refuses. Never Esc outside a find: there it QUITS the agent view.
-  for (let step = 0; ; step++) {
-    const screen = await capture();
-    const findOpen = screen.includes(FIND_MARK) && screen.includes("esc to clear");
-    if (!findOpen && screen.includes(PROMPT_EMPTY)) break;
+  const findOpen = (sc: string) => sc.includes(FIND_MARK) && sc.includes("esc to clear");
+  let screen = await capture();
+  for (let step = 0; findOpen(screen) || !screen.includes(PROMPT_EMPTY); step++) {
     if (step >= 3) throw new Refused("couldn't bring pane 1 back to the agents list");
-    if (findOpen) {
+    if (findOpen(screen)) {
       await tmux(`send-keys -t ${t} Escape`);
+      screen = await settle((sc) => !findOpen(sc));
     } else if (/←\s*\d*\s*agents?/.test(screen) && screen.split("\n").some((l) => /^❯\s*$/.test(l))) {
       await tmux(`send-keys -t ${t} Left`);
+      // Back on the list, possibly with the agent view's restored find open (the next pass clears it).
+      screen = await settle((sc) => sc.includes(PROMPT_EMPTY) || findOpen(sc));
     } else {
       throw new Refused("pane 1 is neither the agents list nor a session with an empty prompt");
     }
-    await sleep(700);
   }
 
   await tmux(`send-keys -t ${t} C-f`);
-  await sleep(400);
-  if (!(await capture()).includes(FIND_MARK)) throw new Refused("Ctrl+F didn't open find in pane 1; nothing was typed");
+  if (!(await settle((sc) => sc.includes(FIND_MARK))).includes(FIND_MARK)) throw new Refused("Ctrl+F didn't open find in pane 1; nothing was typed");
 
   await tmux(`send-keys -t ${t} -l ${q(name)}`);
-  await sleep(700);
-  const found = await capture();
   const head = needle.slice(0, 30);
-  const rows = found
-    .split("\n")
-    .filter((l) => !l.includes(FIND_MARK) && l.toLowerCase().includes(head)).length;
-  const ready = /enter to (open|resume|return)/.test(found) && !found.includes("no sessions match");
-  if (!ready || rows !== 1) {
+  const matchRows = (sc: string) =>
+    sc.split("\n").filter((l) => !l.includes(FIND_MARK) && l.toLowerCase().includes(head)).length;
+  const isReady = (sc: string) => /enter to (open|resume|return)/.test(sc) && !sc.includes("no sessions match");
+  // The typed query shows in the find line once the view has caught up with it.
+  // All three, on the SAME screen, before Enter: the find line shows the whole query (so the list is
+  // filtered by it, not by a prefix still catching up), exactly one row carries the name, and the view
+  // offers Enter on it.
+  const queryShown = (sc: string) => sc.toLowerCase().includes(`${FIND_MARK} n:${needle}`);
+  const found = await settle((sc) => queryShown(sc) && isReady(sc) && matchRows(sc) === 1);
+  const rows = matchRows(found);
+  if (!queryShown(found) || !isReady(found) || rows !== 1) {
     throw new Refused(`find shows ${rows} matching rows for "${name}"; left it open in pane 1 (Esc clears it)`);
   }
 
   await tmux(`send-keys -t ${t} Enter`);
-  await focusGhostty();
 }
 
 async function pick(thread: Thread, agent: Agent | undefined, agents: Agent[]) {
