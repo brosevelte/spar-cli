@@ -1113,7 +1113,7 @@ def sync_claude(
         False, "--init", help="also do the one-time Spark-side setup (register the chrome-devtools MCP), then push"
     ),
 ) -> None:
-    """Copy Claude Code's state between the machines: the global config files, the project's memory dir, and every past session (transcripts plus their subagent/tool-result/workflow sidecars, so the resume list is populated). The project dir is re-keyed for the other machine's absolute path."""
+    """Copy Claude Code's state between the machines: the global config files and the project's memory dir (re-keyed for the other machine's absolute path). Past sessions are NOT copied: atuin's thread capture syncs them continuously through the self-hosted server on the Spark, and `atuin resume` (Ctrl+E) rebuilds any thread from either machine locally, including ones that went on separately on both. This is for setting up a new box, not routine use."""
     c = cfg.load()
     project = project or c.claude_project
     if direction not in {"push", "pull"}:
@@ -1126,16 +1126,10 @@ def sync_claude(
     remote_proj = f"{remote_home}/.claude/projects/{_memory_dir_name(f'{remote_home}/{project}')}"
     local_mem = local_proj / "memory"
     remote_mem = f"{remote_proj}/memory"
-    # A session is its *.jsonl plus a same-named dir of subagent transcripts, offloaded tool results and
-    # workflow runs, which a resumed session can still reference. memory/ is excluded because it is merged
-    # separately (_merge_memory). Never --delete here: each machine keeps its own sessions alongside the other's.
-    transcripts = [*_rsync(c), "-az", "--progress", "--partial", "--exclude=memory/"]
-
     if direction == "push":
         _remote(c, f"mkdir -p {shlex.quote(remote_mem)} ~/.claude")
         if init:
             _remote(c, CHROME_DEVTOOLS_MCP.format(port=c.chrome_port))
-        _run([*transcripts, f"{local_proj}/", f"{c.target}:{remote_proj}/"])
         for name in CLAUDE_FILES:
             path = Path(local_home) / ".claude" / name
             if not path.exists():
@@ -1153,8 +1147,7 @@ def sync_claude(
         for name in CLAUDE_FILES:
             _run([*_scp(c), f"{c.target}:~/.claude/{name}", str(Path(local_home) / ".claude" / name)], check=False)
         _merge_memory(c, local_mem, remote_mem)
-        _run([*transcripts, f"{c.target}:{remote_proj}/", f"{local_proj}/"])
-    typer.secho(f"claude config, memory and sessions {direction}ed ({local_proj} <-> {remote_proj})", fg="green")
+    typer.secho(f"claude config and memory {direction}ed ({local_proj} <-> {remote_proj})", fg="green")
 
 
 DOTFILES = Path(__file__).resolve().parent.parent / "dotfiles"

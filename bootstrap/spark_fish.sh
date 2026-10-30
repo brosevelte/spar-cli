@@ -59,6 +59,49 @@ if ! have bat; then
 fi
 bat --version
 
+# ---- atuin: shell history in SQLite, Ctrl+R search (bound in config.fish) -------------
+# Local-only unless you run `atuin register`/`atuin login` yourself. `import auto` seeds it from
+# fish's own history once; re-running is harmless (atuin dedupes the import).
+step atuin
+if ! have atuin; then
+  curl -fsSL "$(gh_asset atuinsh/atuin '/atuin-aarch64-unknown-linux-gnu\.tar\.gz$')" -o atuin.tgz
+  tar -xzf atuin.tgz --strip-components=1 -C "$HOME/.local/bin" --wildcards '*/atuin' && rm atuin.tgz
+  SHELL="$(command -v fish)" atuin import auto
+fi
+atuin --version
+
+# ---- atuin-server: self-hosted sync, tailnet-only ------------------------------------
+# History is end-to-end encrypted client-side; the server only stores ciphertext. Binds the
+# tailnet IP so nothing off the tailnet can reach it. Registration is closed once an account
+# exists (flip open_registration in ~/.config/atuin/server.toml to add one).
+step atuin-server
+if ! have atuin-server; then
+  curl -fsSL "$(gh_asset atuinsh/atuin '/atuin-server-aarch64-unknown-linux-gnu\.tar\.gz$')" -o atuin-server.tgz
+  tar -xzf atuin-server.tgz --strip-components=1 -C "$HOME/.local/bin" --wildcards '*/atuin-server' && rm atuin-server.tgz
+fi
+mkdir -p "$HOME/.config/atuin" "$HOME/.local/share/atuin" "$HOME/.config/systemd/user"
+if [ ! -f "$HOME/.config/atuin/server.toml" ]; then
+  cat > "$HOME/.config/atuin/server.toml" <<TOML
+host = "$(tailscale ip -4 | head -1)"
+port = 8888
+open_registration = true
+db_uri = "sqlite://$HOME/.local/share/atuin/server.db"
+TOML
+fi
+SPARK_CLI_DIR="${SPARK_CLI_DIR:-$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)}"
+[ -f "$SPARK_CLI_DIR/dotfiles/atuin-server.service" ] && cp "$SPARK_CLI_DIR/dotfiles/atuin-server.service" "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --now atuin-server.service
+systemctl --user is-active atuin-server.service
+# Point this box's client at its own server and capture agent threads. First account on a fresh
+# server: `atuin register -u <name> -e <email>` here, then close open_registration and restart;
+# other machines join with `atuin login` + the key from `atuin key`.
+atuin config set sync_address "http://$(tailscale ip -4 | head -1):8888"
+atuin config set auto_sync true
+atuin config set sync.records true
+atuin config set daemon.autostart true
+atuin threads enable
+
 # ---- link the portable parts of the conf repo ------------------------------------
 # Deliberately NOT linked on Linux: ssh-config (its IdentityFile is the Mac's github key, and
 # linking it breaks git over ssh here), zed-settings, claude-settings.json (pushed re-homed by

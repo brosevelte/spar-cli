@@ -1,0 +1,15 @@
+# atuin sync server for shell history + captured agent threads (Mac <-> Spark).
+# User unit; linger keeps it up without a login. Binds the tailnet address only (see
+# atuin-server.toml), so it is unreachable off the tailnet. Restart=always covers boot races
+# where tailscaled hasn't assigned the 100.x address yet.
+[Unit]
+Description=atuin sync server
+
+[Service]
+ExecStart=%h/.local/bin/atuin-server start
+Environment=ATUIN_CONFIG_DIR=%h/.config/atuin
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
