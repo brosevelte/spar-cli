@@ -21,7 +21,9 @@ if ! have fish; then
   echo "fish is not installed. Run: sudo apt install -y fish" >&2
   exit 1
 fi
-[ -d "$CONF" ] || { echo "conf repo not found at $CONF" >&2; exit 1; }
+# Without a conf repo the tools still install; only the links to your fish/starship config are skipped.
+HAVE_CONF=1
+[ -d "$CONF" ] || { HAVE_CONF=; echo "no conf repo at $CONF: installing tools, skipping config links (set CONF= or CONF_REPO for spark bootstrap)"; }
 
 # Latest release asset for a GitHub repo, matched by substring.
 gh_asset() {
@@ -75,28 +77,39 @@ atuin --version
 # tailnet IP so nothing off the tailnet can reach it. Registration is closed once an account
 # exists (flip open_registration in ~/.config/atuin/server.toml to add one).
 step atuin-server
-if ! have atuin-server; then
+TS_IP="$(tailscale ip -4 2>/dev/null | head -1)"
+# One sync server per box. On a box someone else already serves from, point at theirs instead of
+# starting a second one that can't bind the port.
+SERVE_ATUIN=1
+if ! systemctl --user is-active -q atuin-server.service 2>/dev/null && ss -Hltn "sport = :8888" | grep -q .; then
+  SERVE_ATUIN=
+  echo "  an atuin server already runs on :8888 (another account's); using it. You need an account on it:"
+  echo "  ask its owner to open registration, then: atuin register -u <you> -e <email>"
+fi
+if [ -n "$SERVE_ATUIN" ] && ! have atuin-server; then
   curl -fsSL "$(gh_asset atuinsh/atuin '/atuin-server-aarch64-unknown-linux-gnu\.tar\.gz$')" -o atuin-server.tgz
   tar -xzf atuin-server.tgz --strip-components=1 -C "$HOME/.local/bin" --wildcards '*/atuin-server' && rm atuin-server.tgz
 fi
 mkdir -p "$HOME/.config/atuin" "$HOME/.local/share/atuin" "$HOME/.config/systemd/user"
-if [ ! -f "$HOME/.config/atuin/server.toml" ]; then
+if [ -n "$SERVE_ATUIN" ] && [ ! -f "$HOME/.config/atuin/server.toml" ]; then
   cat > "$HOME/.config/atuin/server.toml" <<TOML
-host = "$(tailscale ip -4 | head -1)"
+host = "$TS_IP"
 port = 8888
 open_registration = true
 db_uri = "sqlite://$HOME/.local/share/atuin/server.db"
 TOML
 fi
 SPARK_CLI_DIR="${SPARK_CLI_DIR:-$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)}"
-[ -f "$SPARK_CLI_DIR/dotfiles/atuin-server.service" ] && cp "$SPARK_CLI_DIR/dotfiles/atuin-server.service" "$HOME/.config/systemd/user/"
-systemctl --user daemon-reload
-systemctl --user enable --now atuin-server.service
-systemctl --user is-active atuin-server.service
+if [ -n "$SERVE_ATUIN" ]; then
+  [ -f "$SPARK_CLI_DIR/dotfiles/atuin-server.service" ] && cp "$SPARK_CLI_DIR/dotfiles/atuin-server.service" "$HOME/.config/systemd/user/"
+  systemctl --user daemon-reload
+  systemctl --user enable --now atuin-server.service
+  systemctl --user is-active atuin-server.service
+fi
 # Point this box's client at its own server and capture agent threads. First account on a fresh
 # server: `atuin register -u <name> -e <email>` here, then close open_registration and restart;
 # other machines join with `atuin login` + the key from `atuin key`.
-atuin config set sync_address "http://$(tailscale ip -4 | head -1):8888"
+atuin config set sync_address "http://$TS_IP:8888"
 atuin config set auto_sync true
 atuin config set sync.records true
 atuin config set daemon.autostart true
@@ -107,6 +120,7 @@ atuin threads enable
 # linking it breaks git over ssh here), zed-settings, claude-settings.json (pushed re-homed by
 # `spark sync claude` instead). Those are macOS-shaped.
 step conf-links
+[ -n "$HAVE_CONF" ] || echo "  skipped (no conf repo)"
 link() {
   local src="$CONF/$1" dest="$2"
   [ -e "$src" ] || { echo "  skip  $1 (missing in conf)"; return; }
@@ -119,20 +133,22 @@ link() {
   ln -s "$src" "$dest"
   echo "  link  $dest"
 }
-link config.fish "$HOME/.config/fish/config.fish"
-link fish_plugins "$HOME/.config/fish/fish_plugins"
-link starship.toml "$HOME/.config/starship.toml"
-for src in "$CONF"/fish-functions/*.fish; do
-  link "fish-functions/$(basename "$src")" "$HOME/.config/fish/functions/$(basename "$src")"
-done
-for src in "$CONF"/fish-completions/*.fish; do
-  link "fish-completions/$(basename "$src")" "$HOME/.config/fish/completions/$(basename "$src")"
-done
+if [ -n "$HAVE_CONF" ]; then
+  link config.fish "$HOME/.config/fish/config.fish"
+  link fish_plugins "$HOME/.config/fish/fish_plugins"
+  link starship.toml "$HOME/.config/starship.toml"
+  for src in "$CONF"/fish-functions/*.fish; do
+    link "fish-functions/$(basename "$src")" "$HOME/.config/fish/functions/$(basename "$src")"
+  done
+  for src in "$CONF"/fish-completions/*.fish; do
+    link "fish-completions/$(basename "$src")" "$HOME/.config/fish/completions/$(basename "$src")"
+  done
+fi
 
 # ---- fisher + the plugins listed in fish_plugins ----------------------------------
 step fisher
 fish -c 'functions -q fisher; or curl -sL https://raw.githubusercontent.com/jorgebucaran/fisher/main/functions/fisher.fish | source && fisher install jorgebucaran/fisher'
-fish -c 'fisher update'
+[ -z "$HAVE_CONF" ] || fish -c 'fisher update'
 
 # ---- make tmux windows open fish ---------------------------------------------------
 # `chsh -s (command -v fish)` is yours to run (it asks for your password) and makes plain ssh

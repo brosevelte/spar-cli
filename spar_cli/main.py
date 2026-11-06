@@ -26,6 +26,24 @@ from spar_cli import config as cfg
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 
 
+@app.callback(invoke_without_command=True)
+def _select_box(
+    ctx: typer.Context,
+    box: str = typer.Option(
+        None,
+        "-h",
+        "--host",
+        envvar="SPARK_BOX",
+        metavar="BOX",
+        help="Which registered box to act on (`spark box list`). Default: the one `spark box use` set.",
+    ),
+) -> None:
+    """Runs before every verb: `spark -h grahams mosh` scopes that one command to box `grahams`."""
+    cfg.SELECTED = box
+    if ctx.invoked_subcommand is None:
+        _show_box(cfg.load())
+
+
 def _run(
     cmd: list[str], *, check: bool = True, capture: bool = False, stdin: str | None = None, cwd: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -107,7 +125,7 @@ def _interactive_ssh(c: cfg.Config, remote_command: str | None, *, tunnel: bool)
     cmd = ["ssh", "-t", "-o", "LogLevel=ERROR", *KEEPALIVE_OPTS, "-p", str(c.port), *_conn_opts(c), c.target]
     if tunnel:
         # The OAuth callback port is deliberately NOT forwarded here -- see `spark auth mcp`.
-        cmd += ["-R", f"{c.chrome_port}:127.0.0.1:{c.chrome_port}"]
+        cmd += ["-R", f"{c.box_chrome_port}:127.0.0.1:{c.chrome_port}"]
     if remote_command:
         cmd.append(remote_command)
     os.execvp(cmd[0], cmd)
@@ -718,9 +736,39 @@ def chrome(
 # exits within ~45s of the link dying (ServerAlive), and launchd restarts it. ExitOnForwardFailure
 # makes a still-held remote port a retry instead of a zombie tunnel that forwards nothing.
 
+# One agent per box: `com.spar-cli.chrome-tunnel.<box>`. The un-suffixed label is what a single-box
+# install created; it is still honoured for the box it points at until `spark tunnel install` replaces it.
 TUNNEL_LABEL = "com.spar-cli.chrome-tunnel"
-TUNNEL_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{TUNNEL_LABEL}.plist"
-TUNNEL_LOG = Path.home() / "Library" / "Logs" / "spark-chrome-tunnel.log"
+LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
+LEGACY_TUNNEL_PLIST = LAUNCH_AGENTS / f"{TUNNEL_LABEL}.plist"
+
+
+def _legacy_tunnel_targets(c: cfg.Config) -> bool:
+    import plistlib
+
+    if not LEGACY_TUNNEL_PLIST.exists():
+        return False
+    try:
+        argv = plistlib.loads(LEGACY_TUNNEL_PLIST.read_bytes()).get("ProgramArguments", [])
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    return c.target in argv
+
+
+def _tunnel_label(c: cfg.Config) -> str:
+    label = f"{TUNNEL_LABEL}.{c.name}"
+    if not (LAUNCH_AGENTS / f"{label}.plist").exists() and _legacy_tunnel_targets(c):
+        return TUNNEL_LABEL
+    return label
+
+
+def _tunnel_plist(c: cfg.Config) -> Path:
+    return LAUNCH_AGENTS / f"{_tunnel_label(c)}.plist"
+
+
+def _tunnel_log(c: cfg.Config) -> Path:
+    return Path.home() / "Library" / "Logs" / f"spark-chrome-tunnel-{c.name}.log"
+
 
 tunnel_app = typer.Typer(
     no_args_is_help=True,
@@ -744,7 +792,7 @@ def _tunnel_argv(c: cfg.Config) -> list[str]:
         str(c.port),
         *_conn_opts(c),
         "-R",
-        f"{c.chrome_port}:127.0.0.1:{c.chrome_port}",
+        f"{c.box_chrome_port}:127.0.0.1:{c.chrome_port}",
         c.target,
     ]
 
@@ -753,9 +801,9 @@ def _launchd_domain() -> str:
     return f"gui/{os.getuid()}"
 
 
-def _tunnel_running() -> bool:
+def _tunnel_running(c: cfg.Config) -> bool:
     out = subprocess.run(
-        ["launchctl", "print", f"{_launchd_domain()}/{TUNNEL_LABEL}"], check=False, text=True, capture_output=True
+        ["launchctl", "print", f"{_launchd_domain()}/{_tunnel_label(c)}"], check=False, text=True, capture_output=True
     )
     return out.returncode == 0 and "state = running" in out.stdout
 
@@ -765,19 +813,23 @@ def _ensure_browser_path(c: cfg.Config) -> bool:
     if not _chrome_up(c):
         _launch_chrome(c, None)
         typer.secho(f"started the debug Chrome on 127.0.0.1:{c.chrome_port}", fg="bright_black", err=True)
-    if platform.system() != "Darwin" or not TUNNEL_PLIST.exists():
+    if platform.system() != "Darwin" or not _tunnel_plist(c).exists():
         return True
-    if not _tunnel_running():
+    if not _tunnel_running(c):
         # kickstart without -k: starts it if stopped, never kills a healthy tunnel.
         subprocess.run(
-            ["launchctl", "kickstart", f"{_launchd_domain()}/{TUNNEL_LABEL}"], check=True, capture_output=True
+            ["launchctl", "kickstart", f"{_launchd_domain()}/{_tunnel_label(c)}"], check=True, capture_output=True
         )
     return False
 
 
 @tunnel_app.command("install")
 def tunnel_install() -> None:
-    """Install (or refresh) the launchd agent. Runs at login and restarts after sleep / network changes. Re-run after changing host, port or key in the config."""
+    """Install (or refresh) the launchd agent for this box (one per box; pick it with `spark -h <box>`). Runs at login and restarts after sleep / network changes. Re-run after changing host, port or key in the config."""
+    _install_tunnel(cfg.load())
+
+
+def _install_tunnel(c: cfg.Config) -> None:
     import plistlib
 
     if platform.system() != "Darwin":
@@ -787,25 +839,33 @@ def tunnel_install() -> None:
             err=True,
         )
         raise typer.Exit(1)
-    c = cfg.load()
-    TUNNEL_PLIST.parent.mkdir(parents=True, exist_ok=True)
-    TUNNEL_LOG.parent.mkdir(parents=True, exist_ok=True)
+    domain = _launchd_domain()
+    if _legacy_tunnel_targets(c):
+        # Replaced by the per-box agent below.
+        subprocess.run(["launchctl", "bootout", f"{domain}/{TUNNEL_LABEL}"], check=False, capture_output=True)
+        LEGACY_TUNNEL_PLIST.unlink(missing_ok=True)
+    label = f"{TUNNEL_LABEL}.{c.name}"
+    plist_path, log = LAUNCH_AGENTS / f"{label}.plist", _tunnel_log(c)
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    log.parent.mkdir(parents=True, exist_ok=True)
     plist = {
-        "Label": TUNNEL_LABEL,
+        "Label": label,
         "ProgramArguments": _tunnel_argv(c),
         "RunAtLoad": True,
         "KeepAlive": True,
         # Retry pace while the Spark is unreachable or a dead session still holds the remote port.
         "ThrottleInterval": 15,
-        "StandardOutPath": str(TUNNEL_LOG),
-        "StandardErrorPath": str(TUNNEL_LOG),
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
     }
-    domain = _launchd_domain()
     # bootout of a not-loaded agent is an expected "no such process"; the bootstrap below is what must succeed.
-    subprocess.run(["launchctl", "bootout", f"{domain}/{TUNNEL_LABEL}"], check=False, capture_output=True)
-    TUNNEL_PLIST.write_bytes(plistlib.dumps(plist))
-    _run(["launchctl", "bootstrap", domain, str(TUNNEL_PLIST)])
-    typer.secho(f"installed {TUNNEL_PLIST.name}; log: {TUNNEL_LOG}", fg="green")
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], check=False, capture_output=True)
+    plist_path.write_bytes(plistlib.dumps(plist))
+    _run(["launchctl", "bootstrap", domain, str(plist_path)])
+    typer.secho(
+        f"installed {plist_path.name}: laptop :{c.chrome_port} -> {c.name} 127.0.0.1:{c.box_chrome_port}; log: {log}",
+        fg="green",
+    )
 
 
 @tunnel_app.command("status")
@@ -820,19 +880,21 @@ def tunnel_status() -> None:
     )
     ok &= chrome_ok
     if platform.system() == "Darwin":
-        installed = TUNNEL_PLIST.exists()
-        running = installed and _tunnel_running()
+        installed = _tunnel_plist(c).exists()
+        running = installed and _tunnel_running(c)
         state = (
             "running"
             if running
             else ("installed but NOT running (see log)" if installed else "not installed (spark tunnel install)")
         )
-        typer.secho(f"tunnel agent: {state}", fg="green" if running else "red")
+        typer.secho(f"tunnel agent ({_tunnel_label(c)}): {state}", fg="green" if running else "red")
         ok &= running
     probe = subprocess.run(
         [
             *_ssh_base(c),
-            _bash(f"curl --silent -m 3 -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{c.chrome_port}/json/version"),
+            _bash(
+                f"curl --silent -m 3 -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{c.box_chrome_port}/json/version"
+            ),
         ],
         check=False,
         text=True,
@@ -840,7 +902,7 @@ def tunnel_status() -> None:
     )
     remote_ok = probe.stdout.strip() == "200"
     typer.secho(
-        f"Spark -> 127.0.0.1:{c.chrome_port}: {'answers' if remote_ok else 'NO ANSWER'}",
+        f"{c.name} -> 127.0.0.1:{c.box_chrome_port}: {'answers' if remote_ok else 'NO ANSWER'}",
         fg="green" if remote_ok else "red",
     )
     ok &= remote_ok
@@ -850,10 +912,12 @@ def tunnel_status() -> None:
 
 @tunnel_app.command("uninstall")
 def tunnel_uninstall() -> None:
-    """Stop the agent and remove its plist; `spark ssh` falls back to the inline forward."""
-    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{TUNNEL_LABEL}"], check=False, capture_output=True)
-    TUNNEL_PLIST.unlink(missing_ok=True)
-    typer.secho("tunnel agent removed", fg="green")
+    """Stop this box's agent and remove its plist; `spark ssh` falls back to the inline forward."""
+    c = cfg.load()
+    label = _tunnel_label(c)
+    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, capture_output=True)
+    _tunnel_plist(c).unlink(missing_ok=True)
+    typer.secho(f"tunnel agent {label} removed", fg="green")
 
 
 # --------------------------------------------------------------------------- files
@@ -1129,7 +1193,7 @@ def sync_claude(
     if direction == "push":
         _remote(c, f"mkdir -p {shlex.quote(remote_mem)} ~/.claude")
         if init:
-            _remote(c, CHROME_DEVTOOLS_MCP.format(port=c.chrome_port))
+            _remote(c, CHROME_DEVTOOLS_MCP.format(port=c.box_chrome_port))
         for name in CLAUDE_FILES:
             path = Path(local_home) / ".claude" / name
             if not path.exists():
@@ -1311,12 +1375,499 @@ def raycast_install() -> None:
     )
 
 
+# --------------------------------------------------------------------------- boxes
+#
+# One laptop, several boxes: each is a [boxes.<name>] table in the config (see spar_cli/config.py).
+# `spark -h <name> <verb>` scopes one command; `spark box use <name>` moves the default.
+
+box_app = typer.Typer(
+    no_args_is_help=True,
+    help="Register boxes and pick the default: `spark box add mine --host 100.x.y.z --user me`, `spark box use mine`, `spark box list`. Any verb runs against another box with `spark -h <name> <verb>`.",
+)
+app.add_typer(box_app, name="box")
+
+
+def _spark_cmd(c: cfg.Config, rest: str) -> str:
+    """How to spell a follow-up command for this box: `-h <name>` only when it isn't the default."""
+    raw = cfg.read_raw()
+    scoped = len(cfg.box_names(raw)) > 1 and cfg.default_name(raw) != c.name
+    return f"spark -h {c.name} {rest}" if scoped else f"spark {rest}"
+
+
+def _show_box(c: cfg.Config) -> None:
+    tunnel = "n/a"
+    if platform.system() == "Darwin":
+        tunnel = f"{_tunnel_label(c)} " + (
+            "running"
+            if _tunnel_running(c)
+            else ("installed, stopped" if _tunnel_plist(c).exists() else "not installed")
+        )
+    rows = [
+        ("box", c.name + ("  (default)" if cfg.default_name(cfg.read_raw()) == c.name else "")),
+        ("ssh", f"{c.target} port {c.port}, key {c.identity_file}"),
+        (
+            "chrome",
+            f"laptop :{c.chrome_port} -> box 127.0.0.1:{c.box_chrome_port}"
+            + ("" if c.remote_chrome_port else "  (not chosen yet; `spark bootstrap --local` picks one)"),
+        ),
+        ("tunnel", tunnel),
+        ("tmux", f"session {c.tmux_session}, project ~/{c.claude_project}"),
+    ]
+    for key, value in rows:
+        typer.echo(f"{key:>7}  {value}")
+
+
+@box_app.command("add")
+def box_add(
+    name: str = typer.Argument(..., help="short name you'll type: mine, grahams"),
+    host: str = typer.Option(None, "--host", help="tailnet IP or MagicDNS name"),
+    user: str = typer.Option(None, "--user", help="your account on the box (default: your local username)"),
+    port: int = typer.Option(None, "--port", help="ssh port (default 2222)"),
+    identity_file: str = typer.Option(None, "--identity-file", help="ssh key (default ~/.ssh/spark)"),
+    tmux_session: str = typer.Option(None, "--tmux-session"),
+    claude_project: str = typer.Option(None, "--claude-project", help="project path under $HOME on the box"),
+    chrome_port: int = typer.Option(
+        None, "--chrome-port", help="box-side port for your Chrome forward (default: picked from your uid)"
+    ),
+    default: bool = typer.Option(False, "--default", help="make it the default box"),
+) -> None:
+    """Register a box, or change one that exists (only the options you pass change). The first box becomes the default. A single-box config from before boxes existed is converted: if its host matches (or you pass no --host), it takes this name."""
+    values = {
+        "host": host,
+        "user": user,
+        "port": port,
+        "identity_file": identity_file,
+        "tmux_session": tmux_session,
+        "claude_project": claude_project,
+        "remote_chrome_port": chrome_port,
+    }
+    path = cfg.upsert_box(name, values, make_default=default)
+    typer.secho(f"{path}: box {name!r} saved", fg="green")
+    _show_box(cfg.load(name))
+    if platform.system() == "Darwin" and _legacy_tunnel_targets(cfg.load(name)):
+        typer.secho(
+            f"Your existing Chrome tunnel agent still works; `spark -h {name} tunnel install` renames it per box.",
+            fg="bright_black",
+        )
+
+
+@box_app.command("list")
+def box_list() -> None:
+    """Every registered box; * marks the default."""
+    raw = cfg.read_raw()
+    default = cfg.default_name(raw)
+    names = cfg.box_names(raw)
+    if not names:
+        typer.echo("no boxes yet: spark box add <name> --host <tailnet-ip> --user <account>")
+        return
+    for name in names:
+        c = cfg.load(name)
+        tunnel = ""
+        if platform.system() == "Darwin":
+            tunnel = "tunnel up" if _tunnel_running(c) else "tunnel down"
+        typer.echo(
+            f"{'*' if name == default else ' '} {name:<12} {c.target}:{c.port:<6} chrome->{c.box_chrome_port:<6} {tunnel}"
+        )
+
+
+@box_app.command("show")
+def box_show() -> None:
+    """Details of the selected box (`spark -h <name>` with no verb does the same)."""
+    _show_box(cfg.load())
+
+
+@box_app.command("use")
+def box_use(name: str) -> None:
+    """Make NAME the default box for every command without -h."""
+    cfg.set_default(name)
+    typer.secho(f"default box: {name}", fg="green")
+    if (RAYCAST_DIR / "package.json").exists():
+        typer.secho(
+            "The Raycast extension follows the box `spark raycast install` last ran for; re-run it to move it here.",
+            fg="bright_black",
+        )
+
+
+@box_app.command("rm")
+def box_rm(name: str) -> None:
+    """Forget a box (its tunnel agent is removed too). Nothing on the box is touched."""
+    c = cfg.load(name)
+    if platform.system() == "Darwin" and _tunnel_plist(c).exists():
+        label = _tunnel_label(c)
+        subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, capture_output=True)
+        _tunnel_plist(c).unlink(missing_ok=True)
+        typer.echo(f"removed tunnel agent {label}")
+    cfg.remove_box(name)
+    typer.secho(f"box {name!r} removed", fg="green")
+
+
+# --------------------------------------------------------------------------- bootstrap
+#
+# Three tiers, because "set up a Spark" is three different jobs done by different people:
+#   --box    once per machine, needs sudo: packages, sshd on 2222, keepalives, no-suspend, accounts.
+#            Run by the box's admin. `--add-user` is how they let someone else in.
+#   --user   once per account on the box, no sudo: toolchain under ~/.local, fish/prompt, the
+#            chrome-devtools MCP on YOUR forward port. Everything here lives in $HOME, so a box
+#            that is "already set up" by someone else still needs this for you.
+#   --local  once per laptop per box: ssh key, mosh, key authorized, Chrome tunnel agent.
+# --all runs local -> box -> user -> tunnel; for someone who isn't an admin the box tier only reports.
+
+REPO = Path(__file__).resolve().parent.parent
+KIT_REMOTE = ".local/share/spar-cli"  # under the box's $HOME
+ADMIN_GROUPS = {"sudo", "admin", "wheel"}
+# Box-side Chrome ports are allotted from here: 9222 + (uid - 1000), so the box's first account keeps 9222.
+CHROME_BASE = 9222
+CHROME_SPAN = 200
+
+
+def _tcp_open(host: str, port: int, timeout: float = 4) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _key_login(c: cfg.Config) -> bool:
+    return subprocess.run([*_ssh_base(c), "true"], check=False, capture_output=True).returncode == 0
+
+
+def _ssh_any(c: cfg.Config, *, tty: bool = False) -> list[str]:
+    """ssh that may prompt (password, Tailscale check) -- for the steps that run before your key works.
+    ControlMaster=auto still applies, so one successful prompt carries every hop after it."""
+    return ["ssh", *(["-t"] if tty else []), "-o", "ConnectTimeout=10", "-p", str(c.port), *_conn_opts(c), c.target]
+
+
+def _push_kit(c: cfg.Config) -> None:
+    """bootstrap/ and dotfiles/ together, so the scripts find their dotfiles at ../dotfiles."""
+    for sub in ("bootstrap", "dotfiles"):
+        if not (REPO / sub).is_dir():
+            raise typer.BadParameter(f"{REPO / sub} missing -- is this an editable install of the spar-cli checkout?")
+    _run([*_ssh_any(c), _bash(f"mkdir -p ~/{KIT_REMOTE}")])
+    _run(
+        [
+            *_rsync(c),
+            "-a",
+            "--delete",
+            "--exclude",
+            "__pycache__",
+            str(REPO / "bootstrap"),
+            str(REPO / "dotfiles"),
+            f"{c.target}:{KIT_REMOTE}/",
+        ]
+    )
+
+
+def _box_listeners(c: cfg.Config) -> tuple[int, dict[int, set[int]]]:
+    """(my uid on the box, {port: uids listening on it}) for the Chrome port range on the box's loopback."""
+    import re
+
+    script = (
+        f"id -u; ss -Hltne '( sport >= :{CHROME_BASE} and sport < :{CHROME_BASE + CHROME_SPAN} )' 2>/dev/null || true"
+    )
+    out = _run([*_ssh_base(c), _bash(script)], capture=True).stdout.splitlines()
+    uid = int(out[0].strip())
+    held: dict[int, set[int]] = {}
+    for line in out[1:]:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        port = int(parts[3].rsplit(":", 1)[1])
+        owner = re.search(r"\buid:(\d+)", line)
+        held.setdefault(port, set()).add(int(owner.group(1)) if owner else -1)
+    return uid, held
+
+
+def _resolve_box_chrome_port(c: cfg.Config) -> cfg.Config:
+    """Give this account a box-side Chrome port nobody else on the box holds, and save it. The box's
+    loopback is shared: on the same port, one user's chrome-devtools MCP drives ANOTHER user's
+    browser, with their sign-ins. Keeps a port already chosen; keeps the laptop port if your own
+    tunnel already holds it there (a box set up before ports were per-user)."""
+    from dataclasses import replace
+
+    uid, held = _box_listeners(c)
+
+    def free(port: int) -> bool:
+        return held.get(port, set()) <= {uid}
+
+    if c.remote_chrome_port:
+        if free(c.remote_chrome_port):
+            return c
+        typer.secho(
+            f"{c.name}: port {c.remote_chrome_port} is held by another account; choosing a new one", fg="yellow"
+        )
+    if not c.remote_chrome_port and held.get(c.chrome_port) == {uid}:
+        choice = c.chrome_port
+    else:
+        choice = CHROME_BASE + min(max(0, uid - 1000), CHROME_SPAN - 1)
+        while not free(choice):
+            choice += 1
+    cfg.set_box_value(c.name, "remote_chrome_port", choice)
+    typer.secho(f"{c.name}: your Chrome forward lands on the box's 127.0.0.1:{choice} (saved)", fg="green")
+    return replace(c, remote_chrome_port=choice)
+
+
+def _run_on_box_detached(c: cfg.Config, tag: str, script: str, env: dict[str, str], log: str) -> int:
+    """Run a kit script on the box so a dropped connection doesn't kill it, and follow its log until it
+    exits. Re-running while it's still going just follows the existing run."""
+    envs = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+    job = f'{envs} bash "$HOME/{KIT_REMOTE}/bootstrap/{script}" > "$0" 2>&1; echo $? > "$1"'
+    remote = f"""
+mkdir -p ~/.cache/spar-cli; P=~/.cache/spar-cli/{tag}.pid; R=~/.cache/spar-cli/{tag}.rc; L=~/{log}
+if [ -f "$P" ] && kill -0 "$(cat "$P")" 2>/dev/null; then
+  echo "== {script} is already running on the box; following its log"
+else
+  rm -f "$R"; : > "$L"
+  nohup bash -c {shlex.quote(job)} "$L" "$R" </dev/null >/dev/null 2>&1 &
+  echo $! > "$P"
+fi
+tail -n +1 -F --pid="$(cat "$P")" "$L" 2>/dev/null
+exit "$(cat "$R" 2>/dev/null || echo 1)"
+"""
+    typer.secho(f"== {script} on {c.name} (log ~/{log})", bold=True)
+    # Not through _run: the echoed wrapper would bury the log it is about to stream.
+    rc = subprocess.run([*_ssh_base(c), _bash(REMOTE_PATH + remote, login=True)], check=False).returncode
+    if rc == 255:
+        typer.secho(
+            f"Lost the connection; {script} keeps running on the box. Re-run the same command to follow it.",
+            fg="yellow",
+        )
+    return rc
+
+
+def _local_prepare(c: cfg.Config) -> bool:
+    """Key, mosh, laptop helpers, and getting the key authorized. False when the box won't let us in yet."""
+    import getpass
+    import shutil
+    import socket
+    from dataclasses import replace
+
+    typer.secho(f"== local: this laptop -> {c.name}", bold=True)
+    key = Path(c.identity_file).expanduser()
+    pub = Path(f"{key}.pub")
+    if not key.exists():
+        key.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # No passphrase: the tunnel agent runs under launchd with BatchMode and no agent to ask.
+        _run(
+            [
+                "ssh-keygen",
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                f"spark {getpass.getuser()}@{socket.gethostname()}",
+                "-f",
+                str(key),
+            ]
+        )
+    typer.echo(f"  key      {key}")
+    if shutil.which("mosh"):
+        typer.echo("  mosh     installed")
+    elif shutil.which("brew"):
+        _run(["brew", "install", "mosh"])
+    else:
+        typer.secho("  mosh     missing and no Homebrew; install mosh for `spark mosh`", fg="yellow")
+    local_bin = Path.home() / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    for src, name in LAPTOP_BINS.items():
+        _run(["install", "-m", "755", str(DOTFILES / src), str(local_bin / name)])
+
+    if _key_login(c):
+        typer.echo(f"  access   key login to {c.target}:{c.port} works")
+        return True
+    for port in dict.fromkeys([c.port, 22]):
+        if not _tcp_open(c.host, port):
+            continue
+        typer.secho(f"  access   your key isn't authorized on {c.target}:{port} yet.", fg="yellow")
+        if not typer.confirm(
+            f"  Copy it now with ssh-copy-id on port {port}? (needs your password on the box, or Tailscale SSH)",
+            default=True,
+        ):
+            break
+        rc = _run(["ssh-copy-id", "-i", str(pub), "-p", str(port), "-o", "ConnectTimeout=10", c.target], check=False)
+        if rc.returncode == 0 and _key_login(replace(c, port=port)):
+            if port != c.port:
+                typer.secho(f"  access   key works on port {port}; port {c.port} comes from the box tier", fg="yellow")
+            else:
+                typer.echo(f"  access   key login to {c.target}:{c.port} works")
+            return True
+        break
+    typer.secho(
+        f"\nThe box doesn't accept your key yet. Send the box's admin {pub} and ask them to run:\n"
+        f"  spark -h <their name for the box> bootstrap --box --add-user {c.user} --pubkey {pub.name}\n"
+        f"Then: {_spark_cmd(c, 'bootstrap --all')}",
+        fg="yellow",
+    )
+    return False
+
+
+def _local_finish(c: cfg.Config) -> cfg.Config:
+    """Chrome forward: pick the box-side port, install the per-box tunnel agent, start the debug Chrome."""
+    c = _resolve_box_chrome_port(c)
+    if platform.system() == "Darwin":
+        _install_tunnel(c)
+        _ensure_browser_path(c)
+    return c
+
+
+def _box_tier(c: cfg.Config, *, add_user: str | None, pubkey: Path | None, required: bool) -> bool:
+    """The sudo tier. Connects on port 22 if the configured port isn't up yet (it's what this tier sets up)."""
+    from dataclasses import replace
+
+    typer.secho(f"== box: {c.name} (machine-wide, sudo)", bold=True)
+    conn = c
+    if not _key_login(c) and c.port != 22 and not _tcp_open(c.host, c.port) and _tcp_open(c.host, 22):
+        typer.secho(
+            f"  port {c.port} isn't up yet; connecting on 22 (may ask for a password or a Tailscale check)", fg="yellow"
+        )
+        conn = replace(c, port=22)
+    groups = set(_run([*_ssh_any(conn), "id -nG"], capture=True).stdout.split())
+    admin = bool(groups & ADMIN_GROUPS)
+    env: dict[str, str] = {}
+    if not admin:
+        if required:
+            typer.secho(f"{c.user} isn't an admin on {c.name}: the box tier needs the box's owner.", fg="red")
+            raise typer.Exit(3)
+        typer.secho(f"  {c.user} isn't an admin here, so this only checks what the owner has set up", fg="bright_black")
+        env["CHECK_ONLY"] = "1"
+    if add_user:
+        env["ADD_USER"] = add_user
+        if pubkey:
+            text = pubkey.expanduser().read_text().strip()
+            if "\n" in text or not text.startswith(("ssh-", "ecdsa-", "sk-")):
+                raise typer.BadParameter(f"{pubkey} doesn't look like one ssh public key")
+            env["PUBKEY"] = text
+    _push_kit(conn)
+    envs = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+    rc = _run(
+        [*_ssh_any(conn, tty=True), _bash(f'{envs} bash "$HOME/{KIT_REMOTE}/bootstrap/spark_box.sh"', login=True)],
+        check=False,
+    ).returncode
+    if rc != 0:
+        typer.secho(f"box tier failed (exit {rc})", fg="red")
+        raise typer.Exit(rc)
+    if add_user:
+        typer.secho(
+            f"\n{add_user} can now log in with that key. Tell them: register this box with\n"
+            f"  spark box add <name> --host {c.host} --user {add_user}\n"
+            f"then run `spark -h <name> bootstrap --all`.",
+            fg="green",
+        )
+    return admin
+
+
+def _user_tier(c: cfg.Config, *, conf_repo: str | None, fish: bool | None) -> cfg.Config:
+    typer.secho(f"== user: {c.target} (your account, no sudo)", bold=True)
+    if not _key_login(c):
+        typer.secho(
+            f"Can't log in to {c.target}:{c.port} with {c.identity_file}. Run `{_spark_cmd(c, 'bootstrap --local')}` first.",
+            fg="red",
+        )
+        raise typer.Exit(1)
+    before = c.box_chrome_port
+    c = _resolve_box_chrome_port(c)
+    if c.box_chrome_port != before and platform.system() == "Darwin" and _tunnel_plist(c).exists():
+        _install_tunnel(c)  # the agent still forwards to the old port
+    _push_kit(c)
+    env = {"CHROME_PORT": str(c.box_chrome_port)}
+    if conf_repo:
+        env["CONF_REPO"] = conf_repo
+    if _run_on_box_detached(c, "bootstrap", "spark_bootstrap.sh", env, "bootstrap.log") != 0:
+        typer.secho("spark_bootstrap.sh failed; the log above (and ~/bootstrap.log on the box) says where.", fg="red")
+        raise typer.Exit(1)
+    probe = _run(
+        [
+            *_ssh_base(c),
+            _bash(
+                REMOTE_PATH
+                + (
+                    "command -v fish >/dev/null && echo fish; "
+                    "[ -d ~/tools/conf ] || [ -d ~/src/conf ] && echo conf; "
+                    "[ -s ~/.claude/.credentials.json ] && echo claude; "
+                    "gh auth status >/dev/null 2>&1 && echo gh; "
+                    "true"
+                ),
+                login=True,
+            ),
+        ],
+        capture=True,
+    ).stdout.split()
+    if fish is None:
+        fish = "fish" in probe
+    if fish:
+        if "fish" not in probe:
+            typer.secho("fish isn't installed on the box (box tier); skipping the shell setup", fg="yellow")
+        else:
+            _run_on_box_detached(c, "fish", "spark_fish.sh", {}, "bootstrap-fish.log")
+    todo = []
+    if "claude" not in probe:
+        todo.append((_spark_cmd(c, "auth claude"), "sign the box's Claude Code in (opens your browser)"))
+    if "gh" not in probe:
+        todo.append((_spark_cmd(c, "ssh") + "  then: gh auth login --web --insecure-storage", "GitHub on the box"))
+    todo.append((_spark_cmd(c, "auth aws"), "if you use AWS: SSO from this laptop, pushed to the box"))
+    todo.append((_spark_cmd(c, "sync claude"), "your Claude config + project memory, from this laptop"))
+    typer.secho("\nSign-ins only you can do:", bold=True)
+    for cmd, why in todo:
+        typer.echo(f"  {cmd:<58} # {why}")
+    return c
+
+
+@app.command()
+def bootstrap(
+    all_: bool = typer.Option(False, "--all", help="everything: local, box (checks only if you're not an admin), user"),
+    box: bool = typer.Option(False, "--box", help="machine-wide setup with sudo (the box admin, once per box)"),
+    user: bool = typer.Option(
+        False, "--user", help="your account on the box: toolchain, shell, MCP (once per account)"
+    ),
+    local: bool = typer.Option(False, "--local", help="this laptop: key, mosh, key authorized, Chrome tunnel"),
+    add_user: str = typer.Option(None, "--add-user", help="with --box: create this account on the box"),
+    pubkey: Path = typer.Option(None, "--pubkey", help="with --add-user: their public key file to authorize"),
+    conf_repo: str = typer.Option(None, "--conf-repo", help="with --user: your dotfiles repo to clone and link"),
+    fish: bool = typer.Option(
+        None, "--fish/--no-fish", help="with --user: shell setup (default: if fish is on the box)"
+    ),
+) -> None:
+    """Set up a box, your account on it, and this laptop -- each idempotent, safe to re-run.
+
+    \b
+    New box, you own it:          spark box add mine --host <ip> --user <you>; spark bootstrap --all
+    Someone else's box, you:      spark box add theirs --host <ip> --user <you>; spark -h theirs bootstrap --local
+                                  (send the printed key to the owner), then spark -h theirs bootstrap --all
+    Someone else's box, the owner: spark bootstrap --box --add-user <them> --pubkey <their key.pub>
+    """
+    if not (all_ or box or user or local):
+        import inspect
+
+        typer.echo(inspect.cleandoc(bootstrap.__doc__ or "").replace("\b\n", "") + "\n")
+        typer.secho("Pick a tier: --all, --box, --user or --local.", fg="red")
+        raise typer.Exit(2)
+    if (add_user and not (box or all_)) or (pubkey and not add_user):
+        raise typer.BadParameter("--add-user goes with --box, and --pubkey with --add-user")
+    c = cfg.load()
+    if (all_ or local) and not _local_prepare(c):
+        raise typer.Exit(1)
+    if all_ or box:
+        _box_tier(c, add_user=add_user, pubkey=pubkey, required=box)
+    if all_ or user:
+        c = _user_tier(c, conf_repo=conf_repo, fish=fish)
+    if all_ or local:
+        if not _key_login(c):
+            typer.secho(f"Skipped the Chrome tunnel: no key login to {c.target}:{c.port} yet.", fg="yellow")
+            raise typer.Exit(1)
+        c = _local_finish(c)
+    typer.secho(f"\nReady: {_spark_cmd(c, 'mosh --tmux')}", fg="green", bold=True)
+
+
 # --------------------------------------------------------------------------- config
 
 
 @app.command()
 def init() -> None:
-    """Write a default ~/.config/spark/config.toml to edit."""
+    """Write the shared-defaults config to edit; then `spark box add <name> --host ...` registers a box."""
     if cfg.CONFIG_PATH.exists():
         typer.echo(f"{cfg.CONFIG_PATH} already exists")
         raise typer.Exit(1)

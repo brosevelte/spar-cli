@@ -8,32 +8,63 @@ Everything shells out to the system `ssh`/`scp`/`rsync`, so your keys, `known_ho
 
 ```bash
 uv tool install --editable .   # puts `spark` on PATH, tracking this checkout
-spark init                     # writes ~/.config/spark/config.toml
+spark box add mine --host 100.x.y.z --user <your account on the box>
+spark bootstrap --all
 ```
 
-Then edit the config — `host` is the only required field:
+Setup is three jobs, often done by different people, so `spark bootstrap` takes the tier as a flag. Each tier is idempotent and safe to re-run:
 
-```toml
-host = "100.x.y.z"            # tailnet IP or MagicDNS name
-user = ""                     # account on the box; empty = your local username
-port = 2222                   # see "Two ways in" below
-identity_file = "~/.ssh/spark"
-tmux_session = "main"
-chrome_port = 9222
-aws_profile = ""              # for `spark auth aws`; empty = ambient AWS_PROFILE
-aws_region = "us-east-1"
-aws_batch_profile = ""        # e.g. "long-exec-ro"; read-only profile for long jobs
-claude_project = "src/ultron-framework"   # for `spark sync claude`
-```
+| tier | who, how often | what |
+|---|---|---|
+| `--box` | the box's admin, once per machine (sudo) | fish + mosh, OpenSSH on 2222, sshd keepalives, suspend masked, docker group + linger for you. `--add-user <name> --pubkey <file>` creates someone else's account (no password, key login only) |
+| `--user` | each person, once per account on the box (no sudo) | the toolchain under `~/.local`, fish/prompt/atuin, tmux.conf + sparkbar, the gh keyring wrapper, and the chrome-devtools MCP on **your** forward port. Everything lives in `$HOME`, so a box someone else already set up still needs this for you |
+| `--local` | each person, once per laptop per box | ssh key (`~/.ssh/spark`, generated if missing), mosh, the key authorized on the box (offers `ssh-copy-id`), the Chrome tunnel agent and its box-side port |
+| `--all` | | local → box → user → tunnel. If you aren't an admin, the box tier only **reports** what the owner hasn't done |
 
-Config is per-user, so several people can share one box, each with their own account and keys.
-
-Once per laptop, after the config:
+### Joining a box someone else already runs
 
 ```bash
-brew install mosh           # for `spark mosh`
-spark tunnel install        # the Chrome forward for agents on the box, as a launchd agent
+# you
+spark box add theirs --host 100.x.y.z --user <you>
+spark -h theirs bootstrap --local     # makes your key; prints what to send the owner
+# the owner, with your ~/.ssh/spark.pub
+spark -h <their name for it> bootstrap --box --add-user <you> --pubkey you.pub
+# you again
+spark -h theirs bootstrap --all       # your account's toolchain, shell, MCP, tunnel; then the sign-ins it lists
 ```
+
+Afterwards it prints the sign-ins only you can do (`spark auth claude`, `gh auth login` on the box, `spark auth aws`, `spark sync claude`). `--user` takes `--conf-repo <git url>` for your own dotfiles and `--no-fish` to skip the shell setup. The bootstrap runs detached on the box (log `~/bootstrap.log`): if the connection drops, re-running the command picks up the log of the run still going.
+
+**A shared box shares one loopback.** The Chrome forward lands on the box's `127.0.0.1:<port>`, and every account's chrome-devtools MCP connects there. If two people use the same port, the second one's tunnel fails, and their agents drive the *first person's* Chrome, with that person's sign-ins. `spark bootstrap` gives each account its own box-side port, `9222 + (uid − 1000)`: the first account keeps 9222, the next gets 9223. It skips any port another uid holds and saves the result as `remote_chrome_port`. The laptop's Chrome stays on `chrome_port` (9222), and one Chrome serves every box. Dev-server ports (3001, …) are shared in the same way, so agree on them. Claude Code's OAuth callback (54545) is fixed and only collides if two people run `/mcp` sign-in at the same moment.
+
+## Several boxes
+
+The config (`~/.config/spark/config.toml`) holds any number of boxes. Top-level keys are shared defaults; `[boxes.<name>]` overrides them per box:
+
+```toml
+default = "mine"
+identity_file = "~/.ssh/spark"
+aws_profile = "..."
+
+[boxes.mine]
+host = "100.72.79.55"
+user = "carter"
+
+[boxes.grahams]
+host = "100.80.1.2"
+user = "carter"
+remote_chrome_port = 9223
+```
+
+| you want | use |
+|---|---|
+| register a box, or change one | `spark box add <name> --host … --user … [--port] [--chrome-port] [--default]` (only the options you pass change) |
+| run any verb against a box | `spark -h grahams mosh --tmux`, `spark -h grahams auth claude`, … (or `SPARK_BOX=grahams`) |
+| change the default | `spark box use grahams` |
+| see them | `spark box list` (`*` = default), `spark -h grahams` / `spark box show` for one |
+| forget one | `spark box rm grahams` (removes its tunnel agent too; nothing on the box is touched) |
+
+Each box gets its own tunnel agent (`com.spar-cli.chrome-tunnel.<name>`), so several can be up at once. A config from before boxes existed is one box named `default`. `spark box add mine` (same host, or no `--host`) renames it, and `spark -h mine tunnel install` replaces the old single agent with the per-box one. Until then the old agent keeps working. `spark box add` rewrites the file: comments are lost, and the first rewrite keeps the original as `config.toml.bak`. The Raycast extension follows whichever box `spark raycast install` last ran for.
 
 ## Day to day
 
@@ -68,7 +99,7 @@ Set `port = 22` in the config if your box has no Tailscale SSH and you want the 
 |---|---|
 | `spark ssh` | plain interactive login shell. Starts the debug Chrome and the tunnel agent if they're down, so agents on the box can always drive a browser. Open as many as you like — but anything that must outlive the connection belongs in `spark tmux` |
 | `spark mosh [--tmux] [name]` | a login shell over mosh: survives sleep, wifi changes and roaming. `--tmux` lands in the default session (`main`); `spark mosh --tmux fe` (or `spark mosh fe`) attaches-or-creates session `fe`. mosh can't forward ports, so it requires the `spark tunnel` agent for Chrome (and says so rather than silently going without). Inside tmux, `prefix N` prompts for a new session and `prefix s` switches between them |
-| `spark tunnel install\|status\|uninstall` | the Chrome debug forward as a launchd agent: one `ssh -N -R 9222` that belongs to no terminal, notices a dead link in ~45s and is restarted by launchd. `status` checks every hop — laptop Chrome, the agent, and `127.0.0.1:9222` as seen from the Spark. Without it, `spark ssh`/`tmux` fall back to an inline forward that dies with that session |
+| `spark tunnel install\|status\|uninstall` | the Chrome debug forward as a launchd agent, one per box: one `ssh -N -R 9222` that belongs to no terminal, notices a dead link in ~45s and is restarted by launchd. `status` checks every hop — laptop Chrome, the agent, and `127.0.0.1:9222` as seen from the Spark. Without it, `spark ssh`/`tmux` fall back to an inline forward that dies with that session |
 | `spark tmux [name]` | attach-or-create a named tmux session (`main` by default). Survives dropped connections, so Claude, dev servers and long builds live here: `spark tmux main`, `spark tmux fe` |
 | `spark run <cmd>` | run one command remotely and stream the output. A single argument goes to bash verbatim, so pipes and redirects work: `spark run 'ls ~/src \| wc -l'`. Several arguments are treated as argv and quoted individually |
 | `spark status` | reachability, toolchain presence, running tmux sessions, bootstrap log tail |
@@ -85,7 +116,9 @@ Set `port = 22` in the config if your box has no Tailscale SSH and you want the 
 | `spark drive pull <folder-url> <dest-on-spark> [--dry-run]` / `spark drive status` | copy a Drive folder straight onto the Spark (Google → box, never via the laptop) in a detached tmux session `drive-<id>`. Re-running resumes; `status` shows each pull's progress and exit code |
 | `spark chrome [url]` | launch a local Chrome with remote debugging on a dedicated profile (Chrome ≥136 refuses it on the default profile). `spark ssh`/`tmux`/`mosh` start it for you; the `spark tunnel` forward lets the remote chrome-devtools MCP drive *your* browser |
 | `spark paste [--notify] [--retain-days 14] [--keep]` | put the image on your Mac's clipboard onto the box and copy its REMOTE path back to your clipboard — see "Images" below |
-| `spark init` | write the config template |
+| `spark box add\|list\|show\|use\|rm` | the boxes this laptop knows; `spark -h <box> <verb>` scopes any verb to one (see "Several boxes") |
+| `spark bootstrap --all\|--box\|--user\|--local` | set up a box, your account on it, and this laptop (see "Install") |
+| `spark init` | write the shared-defaults config template |
 
 ### Things the verbs quietly handle
 
@@ -99,22 +132,14 @@ Set `port = 22` in the config if your box has no Tailscale SSH and you want the 
 
 ## Setting up a fresh box
 
-Toolchain, no sudo, idempotent — safe to re-run:
+`spark bootstrap --all` (see "Install"). What each tier runs, for when one fails:
 
-```bash
-spark push bootstrap/spark_bootstrap.sh '~/spark_bootstrap.sh'
-spark run 'nohup bash ~/spark_bootstrap.sh > ~/bootstrap.log 2>&1 &'
-```
+- **`--box`** runs `bootstrap/spark_box.sh` under a tty so sudo can ask for your password. Before port 2222 exists, it connects on 22 (a password, or Tailscale SSH). `CHECK_ONLY=1` reports without changing anything; that is what a non-admin's `--all` runs.
+- **`--user`** pushes `bootstrap/` and `dotfiles/` together to `~/.local/share/spar-cli` on the box, then runs `spark_bootstrap.sh` and, if fish is installed, `spark_fish.sh` from there. Pushing the bare script on its own (the old `spark push bootstrap/spark_bootstrap.sh`) left it without `../dotfiles`, and tmux.conf, sparkbar and the gh keyring wrapper were skipped without a word. The script now falls back to the kit directory and warns loudly if it can't find either.
 
-Installs uv, node 22, Claude Code, gh (behind a keyring-free wrapper), aws cli v2, pulumi, git-lfs, graphite, ast-grep, fern, rclone; registers the chrome-devtools MCP; writes the PATH/`COLORTERM` block; installs `dotfiles/tmux.conf` if you have none, and always refreshes the helpers it calls (`sparkbar`, holman/spark, `tmux-osc52`). With `CONF_REPO=git@github.com:you/conf.git` it also clones your dotfiles repo and links the shell-agnostic parts (gitconfig, git ignore, gh, graphite). Org-specific repo wiring runs only if the repo exists, so on any other machine it's just a toolchain installer. Override paths with `FW=`, `FE=`, `MEM=`, `CONF_DIR=`.
+`spark_bootstrap.sh` installs uv, node 22, Claude Code, gh (behind a keyring-free wrapper), aws cli v2, pulumi, git-lfs, graphite, ast-grep, fern and rclone. It registers the chrome-devtools MCP on `CHROME_PORT`, writes the PATH/`COLORTERM` block, installs `dotfiles/tmux.conf` if you have none, and always refreshes the helpers it calls (`sparkbar`, holman/spark, `tmux-osc52`). With `CONF_REPO=git@github.com:you/conf.git` (`--conf-repo`) it also clones your dotfiles repo and links the shell-agnostic parts (gitconfig, git ignore, gh, graphite). Org-specific repo wiring runs only if the repo exists, so on any other machine it's just a toolchain installer. Override paths with `FW=`, `FE=`, `MEM=`, `CONF_DIR=`.
 
-Fish + prompt + plugins (needs `sudo apt install -y fish` first, the only sudo step):
-
-```bash
-spark push bootstrap/spark_fish.sh '~/spark_fish.sh' && spark run 'bash ~/spark_fish.sh'
-```
-
-Installs starship, fzf, fd, bat and atuin under `~/.local/bin`, links `config.fish`/`fish_plugins`/`starship.toml`/functions/completions from your conf repo, installs fisher and its plugins, and points tmux's `default-command` at fish. `chsh -s "$(command -v fish)"` is yours to run if you want plain ssh to be fish too.
+`spark_fish.sh` installs starship, fzf, fd, bat and atuin under `~/.local/bin` and links `config.fish`/`fish_plugins`/`starship.toml`/functions/completions from your conf repo. With no conf repo it installs the tools and skips the links. It also installs fisher and its plugins and points tmux's `default-command` at fish. It starts an atuin sync server only if none is running on the box yet; otherwise it points you at the existing one, where the owner has to let you register. `chsh -s "$(command -v fish)"` is yours to run if you want plain ssh to be fish too.
 
 Move tooling checkouts out of `~/src` (which should hold project repos only) and re-point every symlink:
 
@@ -126,7 +151,7 @@ Symlinks are found by their *target*, so broken ones are still caught. Skipping 
 
 ### Steps that need sudo
 
-Done once per box by a human:
+`spark bootstrap --box` does these (except binfmt and the gdm override, which it lists). By hand:
 
 - `sudo usermod -aG docker <user>`, then re-login.
 - `docker run --privileged --rm tonistiigi/binfmt --install amd64` — if your images are `linux/amd64` on an arm64 box. The QEMU equivalent of Rosetta.

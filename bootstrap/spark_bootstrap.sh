@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # One-shot, user-local (no sudo) toolchain bootstrap for the DGX Spark.
 # Idempotent: every step skips itself if the tool is already on PATH.
-# Logs to ~/bootstrap.log; run with: nohup bash spark_bootstrap.sh > ~/bootstrap.log 2>&1 &
+# Normally run by `spark bootstrap --user`, which pushes bootstrap/ AND dotfiles/ to
+# ~/.local/share/spar-cli and runs this from there (log: ~/bootstrap.log).
+#   CHROME_PORT=<n>   box-side port of the laptop Chrome forward (default 9222; spark picks one per user)
+#   CONF_REPO=<git>   your dotfiles repo, linked below
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:$HOME/.local/node/bin:$HOME/.pulumi/bin:$PATH"
 mkdir -p "$HOME/.local/bin" "$HOME/tmp"
-SELF_DOTFILES_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")/../dotfiles" 2>/dev/null && pwd)"
+# dotfiles/ sits next to bootstrap/ in the kit. Copied on its own (the old `spark push` of just this
+# file) there is no ../dotfiles, and tmux.conf, sparkbar and the gh keyring wrapper were skipped
+# without a word -- so fall back to the kit, and say so loudly when neither exists.
+SELF_DOTFILES_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")/../dotfiles" 2>/dev/null && pwd || true)"
+[ -n "$SELF_DOTFILES_EARLY" ] || SELF_DOTFILES_EARLY="$(cd "$HOME/.local/share/spar-cli/dotfiles" 2>/dev/null && pwd || true)"
+if [ -z "$SELF_DOTFILES_EARLY" ]; then
+  echo "WARNING: dotfiles/ not found next to this script or in ~/.local/share/spar-cli -- tmux.conf, sparkbar," >&2
+  echo "         tmux-osc52 and the gh keyring wrapper will be SKIPPED. Run it via \`spark bootstrap --user\`." >&2
+fi
 cd "$HOME/tmp"
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -100,7 +111,7 @@ gt --version; ast-grep --version; fern --version
 # ---- chrome-devtools MCP -> laptop Chrome over the `spark ssh` reverse tunnel ----
 step chrome-devtools-mcp
 claude mcp remove --scope user chrome-devtools >/dev/null 2>&1 || true
-claude mcp add --scope user chrome-devtools -- npx -y chrome-devtools-mcp@latest --browser-url=http://127.0.0.1:9222
+claude mcp add --scope user chrome-devtools -- npx -y chrome-devtools-mcp@latest --browser-url="http://127.0.0.1:${CHROME_PORT:-9222}"
 
 # ---- shell PATH -------------------------------------------------------------
 step bashrc
@@ -138,14 +149,14 @@ rclone version | head -1
 # holman/spark (draws its sparklines) and tmux-osc52
 # (copy-command; the only OSC 52 form mosh forwards -- see dotfiles/tmux-osc52.sh).
 step tmux-conf
-SELF_DOTFILES="$(cd "$(dirname "${BASH_SOURCE[0]}")/../dotfiles" 2>/dev/null && pwd)"
-if [ ! -e "$HOME/.tmux.conf" ] && [ -f "$SELF_DOTFILES/tmux.conf" ]; then
+SELF_DOTFILES="$SELF_DOTFILES_EARLY"
+if [ ! -e "$HOME/.tmux.conf" ] && [ -n "$SELF_DOTFILES" ] && [ -f "$SELF_DOTFILES/tmux.conf" ]; then
   cp "$SELF_DOTFILES/tmux.conf" "$HOME/.tmux.conf"
   echo "  installed ~/.tmux.conf"
 else
   echo "  ~/.tmux.conf exists or source missing; skipping"
 fi
-if [ -d "$SELF_DOTFILES" ]; then
+if [ -n "$SELF_DOTFILES" ] && [ -d "$SELF_DOTFILES" ]; then
   install -m 755 "$SELF_DOTFILES/sparkbar.sh" "$HOME/.local/bin/sparkbar"
   install -m 755 "$SELF_DOTFILES/tmux-osc52.sh" "$HOME/.local/bin/tmux-osc52"
   install -m 755 "$SELF_DOTFILES/aws-sso-state.sh" "$HOME/.local/bin/aws-sso-state"
