@@ -198,6 +198,22 @@ aws_state() {
   aws-sso-state 2>/dev/null || printf 'none'
 }
 
+# gcloud state, same four words, from `gcp-auth-state` (also shared with the prompt). expired = run
+# `spark auth gcp` from the laptop.
+gcp_state() {
+  gcp-auth-state 2>/dev/null || printf 'none'
+}
+
+# One light per cloud, in the cloud's own logo (Material Design Nerd Font icons, so the two have the
+# same advance width): green live, amber lapsed-but-renewing, red signed out.
+cloud_light() { # state glyph
+  case "$1" in
+    ok)   printf '#[fg=#6ec46e]%b' "$2" ;;
+    idle) printf '#[fg=#d9b44a]%b' "$2" ;;   # amber: renews on next use
+    *)    printf '#[fg=#e06c6c]%b' "$2" ;;
+  esac
+}
+
 # bytes/sec -> a FIXED four characters, always: 3 digits plus a unit. A variable-width field
 # here shifts every segment to its left on each tick (9K -> 10K), which reads as the whole bar
 # twitching. SI thresholds (1000, not 1024) keep the mantissa at 3 digits, and network rates are
@@ -299,26 +315,25 @@ render() {
   cpu_seg=$(printf '#[fg=#8a8a8a]%s%s%s %3d%%' "$L_CPU" "$(hue "$cpu_pct")" "$(sparkline pct $h_cpu)" "$cpu_pct")
   mem_seg=$(printf '#[fg=#8a8a8a]%s%s%s %3d/%sG' "$L_MEM" "$(hue "$mem_pct")" "$(sparkline pct $h_mem)" "$mem_used_gb" "$mem_total_gb")
 
-  # Nerd Font cloud, same glyph the shell prompt uses, so the two agree at a glance.
-  case "$(aws_state)" in
-    ok)   aws_seg=$(printf '#[fg=#6ec46e]\uf0c2') ;;
-    idle) aws_seg=$(printf '#[fg=#d9b44a]\uf0c2') ;;   # amber: renews on next use
-    *)    aws_seg=$(printf '#[fg=#e06c6c]\uf0c2') ;;
-  esac
+  # Same glyphs the shell prompt uses (nf-fa-amazon U+F270, nf-md-google_cloud U+F11F6), so the two agree at a glance.
+  aws_seg=$(cloud_light "$(aws_state)" '\uf270')
+  gcp_seg=$(cloud_light "$(gcp_state)" '\U000f11f6')
+  cloud_seg="$aws_seg $gcp_seg"  # one cluster, no separator between the two logos
 
   # Segment order, left to right. Network leads so that on a narrow client (a phone) the least
   # glanceable segment is the one pushed off the edge first, not CPU or GPU. Override per-box with
-  # SPARKBAR_ORDER; an absent segment (no GPU) is simply skipped along with its separator.
-  ORDER=${SPARKBAR_ORDER:-net cpu mem gpu aws}
+  # SPARKBAR_ORDER (`cloud` = both logos together; `aws` / `gcp` place one each); an absent segment
+  # (no GPU) is simply skipped along with its separator.
+  ORDER=${SPARKBAR_ORDER:-net cpu mem gpu cloud}
   out=""
   for key in $ORDER; do
     case $key in
       net) seg=$net_seg ;; cpu) seg=$cpu_seg ;; mem) seg=$mem_seg ;;
-      gpu) seg=$gpu_seg ;; aws) seg=$aws_seg ;; *) seg="" ;;
+      gpu) seg=$gpu_seg ;; aws) seg=$aws_seg ;; gcp) seg=$gcp_seg ;; cloud) seg=$cloud_seg ;; *) seg="" ;;
     esac
     [ -n "$seg" ] && out+="${out:+$SEP}$seg"
   done
-  # Two trailing spaces: the Nerd Font cloud is drawn wider than the one cell it declares.
+  # Two trailing spaces: the Nerd Font logos are drawn wider than the one cell they declare.
   printf '%s  #[default]\n' "$out"
 }
 

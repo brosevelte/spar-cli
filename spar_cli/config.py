@@ -65,6 +65,8 @@ DEFAULTS: dict[str, object] = {
     # Second profile for long-running jobs: read-only on prod, longer role session, sharing the
     # same SSO sign-in as aws_profile. Empty = only the interactive profile is managed.
     "aws_batch_profile": "",
+    # `spark auth gcp`: default project for gcloud, the ADC quota project and GOOGLE_CLOUD_PROJECT on the box.
+    "gcp_project": "",
     # `spark sync claude`: project path relative to $HOME, identical on both machines.
     "claude_project": "src/ultron-framework",
 }
@@ -94,6 +96,7 @@ class Config:
     aws_profile: str
     aws_region: str
     aws_batch_profile: str
+    gcp_project: str
     claude_project: str
 
     @property

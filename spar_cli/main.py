@@ -107,6 +107,46 @@ def _remote(c: cfg.Config, script: str, *, capture: bool = False) -> subprocess.
 # --------------------------------------------------------------------------- session
 
 
+# Mouse tracking (X10 / button / any-motion, and the UTF-8, SGR and urxvt encodings) and focus
+# reporting, all off. A full-screen program that dies without restoring them -- a mosh session killed
+# while tmux had the mouse -- leaves the terminal turning every mouse move into `ESC[<35;x;yM` and
+# every focus change into `ESC[O` on stdin. The next `spark ssh` then shows them twice: echoed by the
+# local tty before ssh goes raw, and echoed again by the box after ssh forwards them, where fish can
+# even read them as keystrokes.
+TERMINAL_RESET = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l"
+
+
+def _reset_terminal() -> None:
+    """Turn the tracking modes off, then discard any reports already queued on stdin."""
+    import termios
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    sys.stdout.write(TERMINAL_RESET)
+    sys.stdout.flush()
+    try:
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except (termios.error, OSError):
+        pass
+
+
+def _session(cmd: list[str]) -> None:
+    """Run an interactive ssh/mosh with a clean terminal on both sides of it. A child process rather
+    than an exec, so the reset can run AFTER the session too -- that is the one that catches a
+    session that died with the mouse still tracked. Ctrl-C belongs to the session: ssh in raw mode
+    sees it as a byte, and before then the child gets the SIGINT itself."""
+    _reset_terminal()
+    proc = subprocess.Popen(cmd)
+    while True:
+        try:
+            rc = proc.wait()
+            break
+        except KeyboardInterrupt:
+            continue
+    _reset_terminal()
+    raise typer.Exit(rc)
+
+
 def _ensure_terminfo(c: cfg.Config) -> None:
     """Terminals like Ghostty (TERM=xterm-ghostty) aren't in Ubuntu's terminfo db, so tmux on the Spark refuses to start ("missing or unsuitable terminal"). Compile the local entry into the remote user's ~/.terminfo once; a no-op when it is already there."""
     term = os.environ.get("TERM", "")
@@ -120,7 +160,7 @@ def _ensure_terminfo(c: cfg.Config) -> None:
 
 
 def _interactive_ssh(c: cfg.Config, remote_command: str | None, *, tunnel: bool) -> None:
-    """Replace this process with an interactive ssh. `tunnel` adds an inline Chrome reverse forward -- only the fallback for when the `spark tunnel` launchd agent isn't installed, since an inline forward dies with this session and only the first session can bind it."""
+    """Run an interactive ssh and exit with its status. `tunnel` adds an inline Chrome reverse forward -- only the fallback for when the `spark tunnel` launchd agent isn't installed, since an inline forward dies with this session and only the first session can bind it."""
     _ensure_terminfo(c)
     cmd = ["ssh", "-t", "-o", "LogLevel=ERROR", *KEEPALIVE_OPTS, "-p", str(c.port), *_conn_opts(c), c.target]
     if tunnel:
@@ -128,14 +168,14 @@ def _interactive_ssh(c: cfg.Config, remote_command: str | None, *, tunnel: bool)
         cmd += ["-R", f"{c.box_chrome_port}:127.0.0.1:{c.chrome_port}"]
     if remote_command:
         cmd.append(remote_command)
-    os.execvp(cmd[0], cmd)
+    _session(cmd)
 
 
 def _interactive_ssh_opening_url(
     c: cfg.Config, remote_command: str, url_pattern: str, *, local_forwards: tuple[int, ...] = ()
-) -> None:
+) -> int:
     """Run an interactive remote command, and open the first URL matching `url_pattern` in THIS
-    machine's browser as soon as it is printed.
+    machine's browser as soon as it is printed. Returns the remote command's exit code.
 
     Login flows on the box try to open a browser there, and the box has none, so all they can do is
     print a URL for you to copy. This owns the ssh session, so it watches the output go by instead.
@@ -150,7 +190,9 @@ def _interactive_ssh_opening_url(
     cmd = ["ssh", "-t", "-o", "LogLevel=ERROR", "-p", str(c.port), *_conn_opts(c), *forwards, c.target, remote_command]
     # A URL can arrive split across reads, so match against a rolling tail of the output. Stop at
     # whitespace AND at control bytes: the URL may be wrapped in colour or OSC-8 hyperlink escapes.
-    rx = re.compile(url_pattern + r"[^\s\x1b\x07]*")
+    # Only a URL that has been followed by one of those counts, so a read that ends mid-URL waits
+    # for the rest instead of opening a truncated link.
+    rx = re.compile(url_pattern + r"[^\s\x1b\x07]*(?=[\s\x1b\x07])")
     opener = os.environ.get("SPARK_URL_OPENER") or ("open" if platform.system() == "Darwin" else "xdg-open")
     state = {"opened": False, "tail": ""}
 
@@ -164,8 +206,10 @@ def _interactive_ssh_opening_url(
                 subprocess.run([opener, match.group(0)], check=False, capture_output=True)
         return data
 
+    _reset_terminal()
     status = pty.spawn(cmd, read)
-    raise typer.Exit(os.waitstatus_to_exitcode(status))
+    _reset_terminal()
+    return os.waitstatus_to_exitcode(status)
 
 
 @app.command()
@@ -207,7 +251,16 @@ def _layout_script(session: str, window: str, cwd: str) -> str:
 
 
 def _ensure_layout(c: cfg.Config, session: str) -> None:
-    _remote(c, _layout_script(session, LAYOUT_WINDOW, c.claude_project))
+    script = _layout_script(session, LAYOUT_WINDOW, c.claude_project)
+    script += f"; printf '\\nspar-cli-version %s\\n' \"$(cat ~/{BOX_VERSION} 2>/dev/null)\""
+    out = _run([*_ssh_base(c), _bash(REMOTE_PATH + script, login=True)], capture=True).stdout.splitlines()
+    version = ""
+    for line in out:
+        if line.startswith("spar-cli-version"):
+            version = line.removeprefix("spar-cli-version").strip()
+        elif line.strip():
+            typer.echo(line)
+    _nudge_if_stale(c, version)
 
 
 @app.command()
@@ -261,7 +314,7 @@ def mosh(
         if not no_layout:
             _ensure_layout(c, name)
         cmd += ["--", "tmux", "new-session", "-A", "-s", name]
-    os.execvp(cmd[0], cmd)
+    _session(cmd)
 
 
 @app.command()
@@ -278,11 +331,13 @@ def status() -> None:
     c = cfg.load()
     script = (
         "hostname; uptime; echo; "
-        "for b in claude uv node gh gt aws pulumi docker ast-grep; do printf '%-9s ' $b; command -v $b || echo MISSING; done; echo; "
+        "for b in claude uv node gh gt aws gcloud pulumi docker ast-grep; do printf '%-9s ' $b; command -v $b || echo MISSING; done; echo; "
         "tmux ls 2>/dev/null || echo 'no tmux sessions'; echo; "
-        "tail -n 3 $(ls -t ~/bootstrap*.log 2>/dev/null | head -1) 2>/dev/null"
+        "tail -n 3 $(ls -t ~/bootstrap*.log 2>/dev/null | head -1) 2>/dev/null; "
+        f"echo; printf 'spar-cli on box: '; cat ~/{BOX_VERSION} 2>/dev/null || echo 'never updated'"
     )
     _remote(c, script)
+    typer.echo(f"spar-cli here:   {_local_version() or 'not a git checkout'}")
 
 
 # --------------------------------------------------------------------------- auth
@@ -295,7 +350,13 @@ app.add_typer(auth_app, name="auth")
 
 def _persist_remote_env(c: cfg.Config, env: dict[str, str]) -> None:
     """Persist env vars on the Spark for every shell. ssh forwards none of these, fish never reads ~/.profile, and a tmux server started earlier holds its own environment — so all three need writing. Each value is a default: something already exported in the session still wins."""
+    import re
+
     header = "# written by `spark auth` — regenerated, don't edit"
+    # Merge with what earlier `spark auth` runs persisted: `auth gcp` must not drop `auth aws`'s vars.
+    current = _run([*_ssh_base(c), _bash("cat ~/.config/spark-env.sh 2>/dev/null; true")], capture=True).stdout
+    merged = {m[1]: m[2] for m in re.finditer(r'^export (\w+)="\$\{\1:-(.*)\}"$', current, re.MULTILINE)}
+    env = {**merged, **env}
     fish = "\n".join(f"set -q {k}; or set -gx {k} {shlex.quote(v)}" for k, v in env.items())
     posix = "\n".join(f'export {k}="${{{k}:-{v}}}"' for k, v in env.items())
     tmux = " ".join(f"tmux setenv -g {k} {shlex.quote(v)} 2>/dev/null;" for k in env for v in [env[k]])
@@ -540,7 +601,9 @@ def auth_drive(
         secret = typer.prompt("OAuth client secret", hide_input=True)
         params += f" client_id={shlex.quote(client_id)} client_secret={shlex.quote(secret)}"
     script = REMOTE_PATH + f"rclone config create {shlex.quote(remote)} drive {params}"
-    _interactive_ssh_opening_url(c, _bash(script, login=True), RCLONE_AUTH_URL, local_forwards=(RCLONE_AUTH_PORT,))
+    raise typer.Exit(
+        _interactive_ssh_opening_url(c, _bash(script, login=True), RCLONE_AUTH_URL, local_forwards=(RCLONE_AUTH_PORT,))
+    )
 
 
 # The authorize URL `claude auth login` prints; opened locally by `spark auth claude`.
@@ -560,8 +623,7 @@ def auth_claude(
     """Sign the Spark's Claude Code into your Anthropic subscription. Default: run `claude auth login` there over ssh and open its sign-in URL in THIS machine's browser automatically; the Spark gets its own token. `--copy` pushes the laptop's token instead: no browser step, but both machines then refresh the same token and can log each other out."""
     c = cfg.load()
     if not copy:
-        _interactive_ssh_opening_url(c, REMOTE_PATH + "claude auth login", CLAUDE_AUTH_URL)
-        return
+        raise typer.Exit(_interactive_ssh_opening_url(c, REMOTE_PATH + "claude auth login", CLAUDE_AUTH_URL))
     if platform.system() != "Darwin":
         raise typer.BadParameter("--copy reads the macOS Keychain; on Linux copy ~/.claude/.credentials.json by hand")
     creds = subprocess.run(
@@ -574,6 +636,83 @@ def auth_claude(
         stdin=creds,
     )
     _remote(c, "claude auth status")
+
+
+# --------------------------------------------------------------------------- gcp
+#
+# The box gets its OWN Google sign-in rather than a copy of the laptop's: `gcloud auth login
+# --no-launch-browser` prints a Google URL, which is opened here, and Google then shows a code that is
+# pasted back into the same session. `--update-adc` writes application-default credentials from that
+# one sign-in, so gcloud/bq/gsutil and the client libraries are covered by one browser trip. No gcloud
+# is needed on the laptop. (The ADC file can't be imported into gcloud instead: `--cred-file` takes
+# service-account and workload-identity files, not a user login.)
+
+GCP_AUTH_URL = r"https://accounts\.google\.com/o/oauth2/auth\?"
+_GCP_REPORT = (
+    'printf "account %s\\n" "$(gcloud config get account 2>/dev/null)"; '
+    'printf "project %s\\n" "$(gcloud config get project 2>/dev/null)"; '
+    "gcloud auth print-access-token --quiet >/dev/null 2>&1 && echo 'cli ok' || echo 'cli FAIL'; "
+    "gcloud auth application-default print-access-token --quiet >/dev/null 2>&1 && echo 'adc ok' || echo 'adc FAIL'"
+)
+
+
+def _gcp_report(c: cfg.Config) -> bool:
+    out = _run(
+        [
+            *_ssh_base(c),
+            _bash(
+                REMOTE_PATH + "command -v gcloud >/dev/null || { echo missing; exit 0; }; " + _GCP_REPORT, login=True
+            ),
+        ],
+        capture=True,
+    ).stdout
+    if out.strip() == "missing":
+        typer.secho(f"gcloud isn't installed on {c.name}: `{_spark_cmd(c, 'bootstrap --user')}` installs it", fg="red")
+        return False
+    rows = dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
+    ok = rows.get("cli") == "ok" and rows.get("adc") == "ok"
+    typer.echo(f"  account  {rows.get('account') or '(none)'}")
+    typer.echo(f"  project  {rows.get('project') or '(unset)'}")
+    for key, label in (("cli", "gcloud CLI token"), ("adc", "application-default (client libraries)")):
+        good = rows.get(key) == "ok"
+        typer.secho(f"  {label}: {'live' if good else 'NOT signed in / refresh failed'}", fg="green" if good else "red")
+    return ok
+
+
+@auth_app.command("gcp")
+def auth_gcp(
+    check: bool = typer.Option(
+        False, "--check", help="no sign-in: report the box's gcloud + ADC state, exit 1 if either is dead"
+    ),
+    project: str = typer.Option(None, "--project", help="set the box's default project (else gcp_project from config)"),
+    account: str = typer.Option(None, "--account", help="pre-select this Google account on the consent page"),
+) -> None:
+    """Sign the box's gcloud AND its application-default credentials into Google in one go. Runs `gcloud auth login --no-launch-browser --update-adc` there, opens Google's consent page in THIS machine's browser, and you paste the code Google shows back into the prompt. The box gets its own token; nothing is copied from the laptop. With a project (--project or gcp_project in the config) it also sets the gcloud default project, the ADC quota project and GOOGLE_CLOUD_PROJECT in every shell on the box. `--check` is the pre-flight before a long job: no sign-in, exit 1 if either credential can't mint a token."""
+    c = cfg.load()
+    if check:
+        raise typer.Exit(0 if _gcp_report(c) else 1)
+    login = "gcloud auth login --no-launch-browser --update-adc --brief" + (
+        f" {shlex.quote(account)}" if account else ""
+    )
+    typer.secho(
+        "Google's page opens in your browser; after you allow access it shows a code -- paste it here.",
+        fg="bright_black",
+    )
+    rc = _interactive_ssh_opening_url(c, _bash(REMOTE_PATH + login, login=True), GCP_AUTH_URL)
+    if rc != 0:
+        typer.secho(f"gcloud auth login exited {rc}", fg="red")
+        raise typer.Exit(rc)
+    project = project or c.gcp_project
+    if project:
+        q = shlex.quote(project)
+        _remote(
+            c,
+            f"gcloud config set project {q} --quiet && "
+            f"(gcloud auth application-default set-quota-project {q} --quiet >/dev/null 2>&1 "
+            f"|| echo 'ADC quota project not set (needs serviceusage.services.use on {project}); ADC still works')",
+        )
+        _persist_remote_env(c, {"GOOGLE_CLOUD_PROJECT": project})
+    raise typer.Exit(0 if _gcp_report(c) else 1)
 
 
 # --------------------------------------------------------------------------- clipboard
@@ -1216,9 +1355,14 @@ def sync_claude(
 
 DOTFILES = Path(__file__).resolve().parent.parent / "dotfiles"
 # Helpers the box's tmux calls, installed to ~/.local/bin exactly as the bootstrap does (same source files, same names).
-DOTFILE_BINS = {"sparkbar.sh": "sparkbar", "tmux-osc52.sh": "tmux-osc52", "aws-sso-state.sh": "aws-sso-state"}
+DOTFILE_BINS = {
+    "sparkbar.sh": "sparkbar",
+    "tmux-osc52.sh": "tmux-osc52",
+    "aws-sso-state.sh": "aws-sso-state",
+    "gcp-auth-state.sh": "gcp-auth-state",
+}
 # Read by the shared starship.toml, so it has to exist on the laptop too.
-LAPTOP_BINS = {"aws-sso-state.sh": "aws-sso-state"}
+LAPTOP_BINS = {"aws-sso-state.sh": "aws-sso-state", "gcp-auth-state.sh": "gcp-auth-state"}
 # The bootstrap copies tmux.conf only when the box has none; sync pushes it unconditionally and re-sources it.
 TMUX_CONF = "tmux.conf"
 # Sampler for sparkbar's history; runs under the systemd user manager so it keeps sampling while no tmux client is attached.
@@ -1760,7 +1904,15 @@ def _box_tier(c: cfg.Config, *, add_user: str | None, pubkey: Path | None, requi
     return admin
 
 
-def _user_tier(c: cfg.Config, *, conf_repo: str | None, fish: bool | None) -> cfg.Config:
+def _user_tier(
+    c: cfg.Config,
+    *,
+    conf_repo: str | None,
+    fish: bool | None,
+    skip_repos: bool = False,
+    replace_tmux_conf: bool = False,
+    signins: bool = True,
+) -> cfg.Config:
     typer.secho(f"== user: {c.target} (your account, no sudo)", bold=True)
     if not _key_login(c):
         typer.secho(
@@ -1776,6 +1928,10 @@ def _user_tier(c: cfg.Config, *, conf_repo: str | None, fish: bool | None) -> cf
     env = {"CHROME_PORT": str(c.box_chrome_port)}
     if conf_repo:
         env["CONF_REPO"] = conf_repo
+    if skip_repos:
+        env["SKIP_REPOS"] = "1"
+    if replace_tmux_conf:
+        env["TMUX_CONF_REPLACE"] = "1"
     if _run_on_box_detached(c, "bootstrap", "spark_bootstrap.sh", env, "bootstrap.log") != 0:
         typer.secho("spark_bootstrap.sh failed; the log above (and ~/bootstrap.log on the box) says where.", fg="red")
         raise typer.Exit(1)
@@ -1803,6 +1959,9 @@ def _user_tier(c: cfg.Config, *, conf_repo: str | None, fish: bool | None) -> cf
             typer.secho("fish isn't installed on the box (box tier); skipping the shell setup", fg="yellow")
         else:
             _run_on_box_detached(c, "fish", "spark_fish.sh", {}, "bootstrap-fish.log")
+    _stamp_box(c)
+    if not signins:
+        return c
     todo = []
     if "claude" not in probe:
         todo.append((_spark_cmd(c, "auth claude"), "sign the box's Claude Code in (opens your browser)"))
@@ -1860,6 +2019,134 @@ def bootstrap(
             raise typer.Exit(1)
         c = _local_finish(c)
     typer.secho(f"\nReady: {_spark_cmd(c, 'mosh --tmux')}", fg="green", bold=True)
+
+
+# --------------------------------------------------------------------------- update
+#
+# After `git pull`, the CLI itself is already current (editable install), but everything it put
+# somewhere else is not: the helpers in the box's ~/.local/bin, ~/.tmux.conf and the bar, tools
+# added since (gcloud), the laptop helpers the prompt calls, tunnel agents whose arguments changed.
+# `spark update` re-applies all of it, idempotently and without the slow repo steps of a bootstrap,
+# and stamps each box with the spar-cli commit it came from so `spark mosh`/`tmux` can say when a
+# box is behind.
+
+BOX_VERSION = ".local/share/spar-cli-state/version"  # under the box's $HOME; outside the kit, which is replaced
+DEPS_STAMP = Path.home() / ".cache" / "spar-cli" / "deps.sha"
+
+
+def _git(*args: str) -> str:
+    out = subprocess.run(["git", "-C", str(REPO), *args], check=False, text=True, capture_output=True)
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _git_ok(*args: str) -> bool:
+    return subprocess.run(["git", "-C", str(REPO), *args], check=False, capture_output=True).returncode == 0
+
+
+def _local_version() -> str:
+    sha = _git("rev-parse", "--short=12", "HEAD")
+    if sha and _git("status", "--porcelain", "--untracked-files=no"):
+        sha += "-dirty"
+    return sha
+
+
+def _stamp_box(c: cfg.Config) -> None:
+    version = _local_version()
+    if version:
+        _remote(c, f"mkdir -p ~/{Path(BOX_VERSION).parent} && printf '%s\\n' {shlex.quote(version)} > ~/{BOX_VERSION}")
+
+
+def _nudge_if_stale(c: cfg.Config, box_version: str) -> None:
+    """One line when the box was last updated from an older spar-cli than this checkout. Silent when it
+    is the same commit, or when the box is AHEAD (updated from a newer checkout on another laptop)."""
+    here = _local_version()
+    if not here:
+        return
+    box_sha = box_version.removesuffix("-dirty")
+    if box_sha == here.removesuffix("-dirty"):
+        return
+    if box_sha:
+        behind = _git_ok("cat-file", "-e", f"{box_sha}^{{commit}}") and _git_ok(
+            "merge-base", "--is-ancestor", box_sha, "HEAD"
+        )
+        if not behind:
+            return
+        why = f"has spar-cli {box_sha[:8]}, this checkout is {here[:8]}"
+    else:
+        why = "has never had `spark update`"
+    typer.secho(f"{c.name} {why}: run `{_spark_cmd(c, 'update')}` to bring it up to date", fg="yellow", err=True)
+
+
+def _update_laptop(pull: bool) -> None:
+    typer.secho("== laptop", bold=True)
+    if pull:
+        _run(["git", "-C", str(REPO), "pull", "--ff-only"])
+    # Editable install: code changes are live already; only new dependencies need a reinstall.
+    deps = hashlib.sha256(
+        b"".join((REPO / f).read_bytes() for f in ("pyproject.toml", "uv.lock") if (REPO / f).exists())
+    ).hexdigest()
+    if not DEPS_STAMP.exists() or DEPS_STAMP.read_text().strip() != deps:
+        _run(["uv", "tool", "install", "--editable", str(REPO), "--force"])
+        DEPS_STAMP.parent.mkdir(parents=True, exist_ok=True)
+        DEPS_STAMP.write_text(deps + "\n")
+    else:
+        typer.echo("  CLI: dependencies unchanged")
+    local_bin = Path.home() / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    for src, name in LAPTOP_BINS.items():
+        _run(["install", "-m", "755", str(DOTFILES / src), str(local_bin / name)])
+    if platform.system() == "Darwin":
+        import plistlib
+
+        for name in cfg.box_names():
+            c = cfg.load(name)
+            plist = _tunnel_plist(c)
+            if not plist.exists():
+                continue
+            try:
+                argv = plistlib.loads(plist.read_bytes()).get("ProgramArguments", [])
+            except (OSError, ValueError, plistlib.InvalidFileException):
+                argv = []
+            if argv != _tunnel_argv(c):
+                _install_tunnel(c)
+            else:
+                typer.echo(f"  tunnel {name}: current")
+
+
+@app.command()
+def update(
+    all_boxes: bool = typer.Option(False, "--all-boxes", help="update every registered box, not just the selected one"),
+    pull: bool = typer.Option(False, "--pull", help="git pull --ff-only this checkout first"),
+    replace_tmux_conf: bool = typer.Option(
+        False,
+        "--replace-tmux-conf",
+        help="take the new tmux.conf even over local edits (yours kept as ~/.tmux.conf.bak)",
+    ),
+    fish: bool = typer.Option(None, "--fish/--no-fish", help="re-run the shell setup (default: if fish is on the box)"),
+    laptop_only: bool = typer.Option(False, "--laptop-only", help="refresh this laptop only, touch no box"),
+) -> None:
+    """Re-apply this checkout after a `git pull`: the laptop (new dependencies, the helpers the prompt calls, tunnel agents whose settings changed) and the box (your account's toolchain -- new tools like gcloud get installed, existing ones are skipped -- the status-bar helpers and sampler, ~/.tmux.conf unless you've edited it, the shell setup, then tmux re-sourced so the bar changes in place). Skips the slow repo steps of `bootstrap` (submodules, uv sync, npm install). Safe to run any time; `spark mosh`/`tmux` tell you when a box is behind."""
+    _update_laptop(pull)
+    if laptop_only:
+        return
+    names = cfg.box_names() if all_boxes else [cfg.load().name]
+    failed = []
+    for name in names:
+        c = cfg.load(name)
+        if not _key_login(c):
+            typer.secho(f"== {name}: can't log in to {c.target}:{c.port}; skipped", fg="yellow")
+            failed.append(name)
+            continue
+        try:
+            _user_tier(
+                c, conf_repo=None, fish=fish, skip_repos=True, replace_tmux_conf=replace_tmux_conf, signins=False
+            )
+        except typer.Exit:
+            failed.append(name)
+    if failed:
+        typer.secho(f"\nNot updated: {', '.join(failed)}", fg="red")
+        raise typer.Exit(1)
+    typer.secho(f"\nUp to date at spar-cli {_local_version()}: {', '.join(names)}", fg="green", bold=True)
 
 
 # --------------------------------------------------------------------------- config

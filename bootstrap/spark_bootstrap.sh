@@ -5,6 +5,8 @@
 # ~/.local/share/spar-cli and runs this from there (log: ~/bootstrap.log).
 #   CHROME_PORT=<n>   box-side port of the laptop Chrome forward (default 9222; spark picks one per user)
 #   CONF_REPO=<git>   your dotfiles repo, linked below
+#   SKIP_REPOS=1      stop after the toolchain (what `spark update` passes): no submodules, uv sync, npm
+#   TMUX_CONF_REPLACE=1  replace ~/.tmux.conf even if it has local edits (old one kept as .bak)
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:$HOME/.local/node/bin:$HOME/.pulumi/bin:$PATH"
@@ -83,6 +85,18 @@ if ! have aws; then
 fi
 aws --version
 
+# ---- gcloud (Google Cloud CLI, with bq and gsutil) -----------------------------
+# User-local tarball, linked into ~/.local/bin (the gcloud wrapper resolves its own symlink). Sign
+# in from the laptop with `spark auth gcp`, which covers the CLI and application-default creds.
+step gcloud
+if ! have gcloud; then
+  curl -fsSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-arm.tar.gz -o gcloud.tgz
+  rm -rf "$HOME/.local/google-cloud-sdk" && tar -xzf gcloud.tgz -C "$HOME/.local" && rm gcloud.tgz
+  "$HOME/.local/google-cloud-sdk/install.sh" --quiet --usage-reporting=false --path-update=false --command-completion=false >/dev/null
+  for b in gcloud gsutil bq; do ln -sf "$HOME/.local/google-cloud-sdk/bin/$b" "$HOME/.local/bin/$b"; done
+fi
+gcloud --version | head -1
+
 # ---- pulumi -----------------------------------------------------------------
 step pulumi
 if ! have pulumi; then curl -fsSL https://get.pulumi.com | sh; fi
@@ -149,17 +163,55 @@ rclone version | head -1
 # holman/spark (draws its sparklines) and tmux-osc52
 # (copy-command; the only OSC 52 form mosh forwards -- see dotfiles/tmux-osc52.sh).
 step tmux-conf
+# ~/.tmux.conf follows dotfiles/tmux.conf as long as you haven't edited it: the hash of the copy last
+# installed is kept in STATE, and a file still matching it is replaced by the new version. A file
+# that matches neither is yours and is left alone (TMUX_CONF_REPLACE=1 / `spark update
+# --replace-tmux-conf` takes the new one anyway). The default-command block spark_fish.sh appends is
+# not an edit: it is ignored when hashing and re-appended after a replace.
 SELF_DOTFILES="$SELF_DOTFILES_EARLY"
-if [ ! -e "$HOME/.tmux.conf" ] && [ -n "$SELF_DOTFILES" ] && [ -f "$SELF_DOTFILES/tmux.conf" ]; then
-  cp "$SELF_DOTFILES/tmux.conf" "$HOME/.tmux.conf"
-  echo "  installed ~/.tmux.conf"
-else
-  echo "  ~/.tmux.conf exists or source missing; skipping"
+STATE="$HOME/.local/share/spar-cli-state"
+mkdir -p "$STATE"
+# Blank lines don't count either: the fish block starts with one.
+conf_sha() { { grep -v -e '^[[:space:]]*$' -e '^# Open fish in tmux windows' -e 'default-command' "$1" || true; } | sha256sum | cut -d' ' -f1; }
+if [ -n "$SELF_DOTFILES" ] && [ -f "$SELF_DOTFILES/tmux.conf" ]; then
+  NEW_CONF="$SELF_DOTFILES/tmux.conf"
+  new_sha=$(conf_sha "$NEW_CONF")
+  replace=
+  if [ ! -e "$HOME/.tmux.conf" ]; then
+    replace=1
+  else
+    cur_sha=$(conf_sha "$HOME/.tmux.conf")
+    if [ "$cur_sha" = "$new_sha" ]; then
+      echo "  ~/.tmux.conf is current"
+      echo "$new_sha" > "$STATE/tmux.conf.sha"
+    elif [ "$cur_sha" = "$(cat "$STATE/tmux.conf.sha" 2>/dev/null)" ] || [ -n "${TMUX_CONF_REPLACE:-}" ]; then
+      replace=1
+    else
+      echo "  ~/.tmux.conf has local edits; kept. To take the new one (yours saved as ~/.tmux.conf.bak):"
+      echo "    spark update --replace-tmux-conf     or compare: diff ~/.tmux.conf $NEW_CONF"
+    fi
+  fi
+  if [ -n "$replace" ]; then
+    had_fish=
+    if [ -e "$HOME/.tmux.conf" ]; then
+      grep -q default-command "$HOME/.tmux.conf" && had_fish=1
+      cp "$HOME/.tmux.conf" "$HOME/.tmux.conf.bak"
+    fi
+    cp "$NEW_CONF" "$HOME/.tmux.conf"
+    if [ -n "$had_fish" ]; then
+      printf '\n# Open fish in tmux windows without changing the login shell (config.fish sets PATH itself).\nif-shell "command -v fish" "set -g default-command '"'"'exec fish -l'"'"'"\n' >> "$HOME/.tmux.conf"
+    fi
+    echo "$new_sha" > "$STATE/tmux.conf.sha"
+    echo "  installed ~/.tmux.conf"
+  fi
+  # A running server keeps the old config until told; this is what makes the bar change in place.
+  tmux source-file "$HOME/.tmux.conf" 2>/dev/null && tmux refresh-client -S 2>/dev/null || true
 fi
 if [ -n "$SELF_DOTFILES" ] && [ -d "$SELF_DOTFILES" ]; then
   install -m 755 "$SELF_DOTFILES/sparkbar.sh" "$HOME/.local/bin/sparkbar"
   install -m 755 "$SELF_DOTFILES/tmux-osc52.sh" "$HOME/.local/bin/tmux-osc52"
   install -m 755 "$SELF_DOTFILES/aws-sso-state.sh" "$HOME/.local/bin/aws-sso-state"
+  install -m 755 "$SELF_DOTFILES/gcp-auth-state.sh" "$HOME/.local/bin/gcp-auth-state"
   # sparkbar's sampler: keeps vitals history rolling while no tmux client is attached.
   mkdir -p "$HOME/.config/systemd/user"
   install -m 644 "$SELF_DOTFILES/sparkbar-sampler.service" "$HOME/.config/systemd/user/sparkbar-sampler.service"
@@ -204,6 +256,12 @@ fi
 # Everything below is specific to this org's checkout layout and is skipped when the repo is absent,
 # so the script is still a plain toolchain installer on any other machine. Override with FW=.
 step repos
+if [ -n "${SKIP_REPOS:-}" ]; then
+  echo "  SKIP_REPOS set; leaving repos alone"
+  step DONE
+  printf 'bootstrap complete %s\n' "$(date -u +%FT%TZ)"
+  exit 0
+fi
 FW="${FW:-$HOME/src/ultron-framework}"
 if [ ! -d "$FW" ]; then
   echo "  $FW not present; skipping repo wiring, SDK sync and frontend install"
