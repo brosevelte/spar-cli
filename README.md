@@ -302,7 +302,24 @@ The command (and the `--notify` notification) also prints the upload's pixel siz
 
 Short and plainly not a path, so a premature or failed paste is obvious and quick to delete — rather than a path to a missing file, which Claude would fail to read. The placeholder also stops a quick *local* paste returning the stale screenshot during the second or two a large upload takes.
 
-Bind it to a hotkey — `conf/skhdrc` has `Cmd-Shift-Opt-5` (capture a region *and* ship it, via `screencapture -i -c`) and `Cmd-Shift-Opt-V` (ship whatever image is already on the clipboard). skhd runs commands with a minimal PATH and never reads your shell config, so the binding needs the absolute path to `spark`.
+### Hotkeys: the path only where you want it
+
+Swapping the screenshot for its path is wrong everywhere *except* the remote prompt — Cmd-V into Slack sends a path nobody can open. So the hotkeys don't touch the clipboard at all:
+
+```bash
+spark hotkeys install   # skhd fragment + Ghostty Cmd-V script; re-run after upgrading spar-cli
+```
+
+| key | does |
+|---|---|
+| `Cmd-Shift-Opt-5` | capture a region (`screencapture -i -c`) and ship it |
+| `Cmd-Shift-Opt-V` | ship the image already on the clipboard |
+| then `Cmd-V` in a **Spark Ghostty tab** | types the remote path (bracketed, like a paste); if the upload is still running it waits for it — no `UPLOADING` placeholder |
+| then `Cmd-V` **anywhere else** | the image, untouched — Slack gets the screenshot |
+
+How: `spark paste --ghostty` leaves the image on the clipboard, writes the path to `~/Library/Caches/spark/paste-state.json` keyed by the pasteboard's `changeCount`, and arms an skhd mode (`spark_shot`, via `skhd -k`). Only in that mode, and only for Ghostty, is Cmd-V intercepted: `~/.config/spark/ghostty-paste.js` checks the focused tab's title for `[spark-` and that the clipboard hasn't changed since, then either types the path (Ghostty AppleScript `input text`) or does Ghostty's own paste. Copy anything else and the next Ghostty Cmd-V is a normal paste that disarms the mode — so ordinary pastes never pay for the check, and one right after a screenshot costs ~0.1s.
+
+`install` writes `~/.config/skhd/spark.skhdrc` with absolute paths (skhd runs commands with a minimal PATH and never reads your shell config), adds a `.load` line for it to your main skhdrc (through the symlink, if it lives in a dotfiles repo), comments out any old binding there that runs `spark paste`, enables `macos-applescript` in Ghostty, and reloads skhd. Plain `spark paste` from a terminal still copies the path, as above.
 
 ## Browser testing from the box
 
