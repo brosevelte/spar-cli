@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -721,7 +722,8 @@ def auth_gcp(
 # JXA over NSPasteboard rather than AppleScript's `write theData to fh`: AppleScript marshals the
 # blob through its own data type and takes ~1.2s on a 4k-wide screenshot; NSData.writeToFile is
 # ~80ms for the same bytes (measured 2026-10-27, byte-identical output). PNG is the flavour
-# Claude reads; TIFF is what some apps put there instead, so it is the fallback.
+# Claude reads; TIFF is what some apps put there instead, so it is the fallback. It prints the
+# pasteboard's changeCount, which identifies THIS clipboard content for `--ghostty` (see below).
 _CLIPBOARD_PNG = """
 ObjC.import("AppKit");
 var pb = $.NSPasteboard.generalPasteboard;
@@ -729,6 +731,7 @@ var d = pb.dataForType($.NSPasteboardTypePNG);
 if (d.isNil()) d = pb.dataForType($.NSPasteboardTypeTIFF);
 if (d.isNil()) throw new Error("no image on the clipboard");
 if (!d.writeToFileAtomically(%s, true)) throw new Error("write failed");
+pb.changeCount;
 """
 
 # What the clipboard holds while an upload is in flight, or when it fails. Short and plainly not
@@ -766,11 +769,18 @@ def paste(
     notify: bool = typer.Option(
         False, "--notify", help="post a macOS notification (for hotkey use, where there is no terminal to read)"
     ),
+    ghostty: bool = typer.Option(
+        False,
+        "--ghostty",
+        help="leave the IMAGE on the clipboard and arm the `spark hotkeys` skhd mode, so Cmd-V in a Spark Ghostty tab types the remote path while Cmd-V anywhere else (Slack) still pastes the image",
+    ),
     retain_days: int = typer.Option(14, help="delete uploads older than this many days on each run"),
 ) -> None:
     """Put the image on this Mac's clipboard onto the box and copy its REMOTE path back to your clipboard.
 
     Terminals transmit only text, and Claude Code reads images from the clipboard of the machine it runs on — which, over ssh, is the box's headless one. So pasting a screenshot into a remote Claude session cannot work. Claude does read an image from a path, though: run this, then press Cmd-V in the remote prompt to paste the path.
+
+    With --ghostty (what the `spark hotkeys install` bindings use) the clipboard is left alone: the path goes to a state file instead, and only Cmd-V in a Spark Ghostty tab reads it.
     """
     c = cfg.load()
     if platform.system() != "Darwin":
@@ -778,16 +788,18 @@ def paste(
     stamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
     local = Path(tempfile.gettempdir()) / f"clip-{stamp}.png"
     script = _CLIPBOARD_PNG % json.dumps(str(local))
-    if (
-        subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", script], capture_output=True, text=True, check=False
-        ).returncode
-        != 0
-    ):
-        _clip(PASTE_ERROR_NO_IMAGE)
+    extracted = subprocess.run(
+        ["osascript", "-l", "JavaScript", "-e", script], capture_output=True, text=True, check=False
+    )
+    if extracted.returncode != 0:
+        if not ghostty:
+            _clip(PASTE_ERROR_NO_IMAGE)
         if notify:
             _notify("No image on the clipboard", "Copy a screenshot first.")
         raise typer.BadParameter("no image on the clipboard (copy a screenshot first)")
+    if ghostty:
+        _paste_for_ghostty(c, local, int(extracted.stdout.strip()), keep=keep, notify=notify, retain_days=retain_days)
+        return
 
     # A paste cannot block -- Cmd-V reads whatever is on the clipboard at that instant. So the
     # clipboard only ever holds the truth: a placeholder while the upload runs, the path once the
@@ -796,23 +808,7 @@ def paste(
     _clip(PASTE_UPLOADING)
     size = _png_size(local)
     try:
-        # One round trip: make the directory, prune old uploads (nothing else writes here), and
-        # report $HOME so the published path is absolute. Plain bash, so ~/.profile can't pollute it.
-        remote_dir = _run(
-            [
-                *_ssh_base(c),
-                _bash(
-                    "mkdir -p ~/clipboard; "
-                    f"find ~/clipboard -name 'clip-*.png' -mtime +{retain_days} -delete 2>/dev/null; "
-                    'printf %s "$HOME/clipboard"'
-                ),
-            ],
-            capture=True,
-        ).stdout.strip()
-        remote = f"{remote_dir}/{local.name}"
-        # rsync exits 0 only once the whole file is on the box, so the path is published after this.
-        # No -z: a PNG is already compressed, so it only burns CPU on both ends.
-        _run([*_rsync(c), "-a", str(local), f"{c.target}:{remote}"])
+        remote = _upload_clip(c, local, retain_days)
     except subprocess.CalledProcessError:
         _clip(PASTE_ERROR_UPLOAD)
         if notify:
@@ -824,6 +820,231 @@ def paste(
     if notify:
         _notify("Image uploaded", f"{size} — path copied, Cmd-V into the remote prompt")
     typer.secho(f"{remote}  {size}  (copied to your clipboard — Cmd-V into the remote prompt)", fg="green")
+
+
+def _upload_clip(c: cfg.Config, local: Path, retain_days: int) -> str:
+    """Upload a clip to ~/clipboard on the box and return its absolute remote path. Returns only once the file has landed."""
+    # One round trip: make the directory, prune old uploads (nothing else writes here), and
+    # report $HOME so the published path is absolute. Plain bash, so ~/.profile can't pollute it.
+    remote_dir = _run(
+        [
+            *_ssh_base(c),
+            _bash(
+                "mkdir -p ~/clipboard; "
+                f"find ~/clipboard -name 'clip-*.png' -mtime +{retain_days} -delete 2>/dev/null; "
+                'printf %s "$HOME/clipboard"'
+            ),
+        ],
+        capture=True,
+    ).stdout.strip()
+    remote = f"{remote_dir}/{local.name}"
+    # rsync exits 0 only once the whole file is on the box, so the path is published after this.
+    # No -z: a PNG is already compressed, so it only burns CPU on both ends.
+    _run([*_rsync(c), "-a", str(local), f"{c.target}:{remote}"])
+    return remote
+
+
+# --------------------------------------------------------------------------- paste --ghostty
+#
+# The plain `paste` swaps the screenshot on the clipboard for its remote path, so a Cmd-V in Slack
+# sends a path nobody can open. --ghostty leaves the image where it is and publishes the path in
+# PASTE_STATE instead, keyed by the pasteboard's changeCount (which moves on every copy, so a later
+# Cmd-C anywhere makes the state stale by itself). It then arms the skhd mode SKHD_MODE, the only
+# place Cmd-V is intercepted, and only for Ghostty: GHOSTTY_PASTE_JS types the path when the focused
+# tab is a Spark session and the clipboard still holds this image, and otherwise does Ghostty's own
+# paste and disarms the mode. So an ordinary Cmd-V never pays for the check; one in Ghostty right
+# after a screenshot costs ~0.2s. Unlike a clipboard, the check CAN wait, so a Cmd-V while the
+# upload is still running pastes the path once it lands instead of a placeholder.
+
+PASTE_STATE = Path.home() / "Library" / "Caches" / "spark" / "paste-state.json"
+SKHD_MODE = "spark_shot"
+SKHD_ARM = "hyper - f19"  # never typed by hand; `skhd -k` presses it to enter SKHD_MODE
+SKHD_DISARM = "hyper - f18"
+
+
+def _write_paste_state(**state: object) -> None:
+    PASTE_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PASTE_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    tmp.replace(PASTE_STATE)  # atomic, so the Cmd-V handler never reads half a file
+
+
+def _skhd_key(key: str) -> None:
+    skhd = shutil.which("skhd") or "/opt/homebrew/bin/skhd"
+    subprocess.run([skhd, "-k", key], check=False, capture_output=True)
+
+
+def _paste_for_ghostty(c: cfg.Config, local: Path, count: int, *, keep: bool, notify: bool, retain_days: int) -> None:
+    size = _png_size(local)
+    _write_paste_state(count=count, state="uploading", box=c.name)
+    _skhd_key(SKHD_ARM)
+    try:
+        remote = _upload_clip(c, local, retain_days)
+    except subprocess.CalledProcessError:
+        _write_paste_state(count=count, state="error", box=c.name)
+        if notify:
+            _notify("Upload failed", "Nothing landed on the box; Cmd-V in Ghostty pastes nothing.")
+        raise
+    _write_paste_state(count=count, state="ok", path=remote, size=size, box=c.name)
+    if not keep:
+        local.unlink(missing_ok=True)
+    if notify:
+        _notify("Image uploaded", f"{size} — Cmd-V in the Spark tab pastes the path; elsewhere, the image")
+    typer.secho(f"{remote}  {size}  (Cmd-V in a Spark Ghostty tab pastes this path)", fg="green")
+
+
+# --------------------------------------------------------------------------- hotkeys
+#
+# The screenshot hotkeys and the Ghostty Cmd-V intercept, as an skhd fragment generated here (it
+# needs absolute paths: skhd runs commands with a minimal PATH and never reads your shell config)
+# and pulled into your main skhdrc with one `.load` line.
+
+hotkeys_app = typer.Typer(
+    no_args_is_help=True,
+    help="Global hotkeys (skhd): Cmd-Shift-Opt-5 captures a region and ships it to the box, Cmd-Shift-Opt-V ships the clipboard image; afterwards Cmd-V in a Spark Ghostty tab pastes the remote path while everywhere else still pastes the image.",
+)
+app.add_typer(hotkeys_app, name="hotkeys")
+
+SKHD_FRAGMENT = Path.home() / ".config" / "skhd" / "spark.skhdrc"
+GHOSTTY_PASTE_SCRIPT = Path.home() / ".config" / "spark" / "ghostty-paste.js"
+# The box's shell titles the terminal `[spark-<id>] ...` (the Raycast extension matches the same).
+GHOSTTY_TAB_MATCH = "[spark-"
+
+# Run by skhd for Cmd-V in Ghostty while SKHD_MODE is armed. Leaves the mode itself (skhd -k) once
+# the screenshot is no longer what's on the clipboard, so the binding is one plain command whatever
+# $SHELL skhd runs it under. One osascript process does everything (~0.1s), because the Cmd-V waits
+# on it. Returns what it did, for testing.
+_GHOSTTY_PASTE_JS = """\
+ObjC.import("AppKit");
+var STATE = %(state)s, MATCH = %(match)s, DISARM = %(disarm)s;
+function readState() {
+  var s = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(STATE, $.NSUTF8StringEncoding, null));
+  try { return s ? JSON.parse(s) : null; } catch (e) { return null; }
+}
+function disarm(what) {
+  var app = Application.currentApplication();
+  app.includeStandardAdditions = true;
+  try { app.doShellScript(DISARM); } catch (e) {}
+  return what + "+disarm";
+}
+function run() {
+  var g = Application("Ghostty"), t, name;
+  try { t = g.windows[0].selectedTab.focusedTerminal; name = t.name(); } catch (e) { return "no-terminal"; }
+  var st = readState();
+  // Number(): the bridge hands NSInteger back as a string, which never === the JSON number.
+  if (!st || st.count !== Number($.NSPasteboard.generalPasteboard.changeCount)) {
+    g.performAction("paste_from_clipboard", { on: t });  // clipboard moved on: a normal paste, and stand down
+    return disarm("paste");
+  }
+  if (name.indexOf(MATCH) < 0) { g.performAction("paste_from_clipboard", { on: t }); return "paste"; }
+  for (var i = 0; st && st.state === "uploading" && i < 300; i++) { delay(0.1); st = readState(); }
+  if (st && st.state === "ok") { g.inputText(st.path, { to: t }); return "path"; }
+  if (st && st.state === "uploading") return "timeout";  // still uploading after 30s: paste nothing, stay armed
+  return disarm("error");
+}
+"""
+
+
+def _ghostty_paste_js(skhd: str) -> str:
+    return _GHOSTTY_PASTE_JS % {
+        "state": json.dumps(str(PASTE_STATE)),
+        "match": json.dumps(GHOSTTY_TAB_MATCH),
+        "disarm": json.dumps(f'{shlex.quote(skhd)} -k "{SKHD_DISARM}"'),
+    }
+
+
+def _skhd_fragment(spark: str, skhd: str) -> str:
+    js = shlex.quote(str(GHOSTTY_PASTE_SCRIPT))
+    ship = f"{spark} paste --notify --ghostty"
+    return f"""\
+# Generated by `spark hotkeys install` (spar-cli) -- edits are overwritten; change spar_cli/main.py instead.
+#
+# After a screenshot the image stays on the clipboard (Cmd-V in Slack pastes the image) and the
+# `{SKHD_MODE}` mode is armed. Only in that mode, and only in Ghostty, Cmd-V runs a check: in a
+# Spark tab it types the image's REMOTE path (waiting for the upload if it's still running);
+# anywhere else it's Ghostty's normal paste. Copying anything else disarms it at the next Ghostty
+# Cmd-V. The screenshot keys are bound in both modes, because skhd only runs the current mode's.
+
+:: {SKHD_MODE}
+default, {SKHD_MODE} < {SKHD_ARM} ; {SKHD_MODE}
+{SKHD_MODE} < {SKHD_DISARM} ; default
+
+# Cmd-Shift-Opt-5: grab a region and ship it. Cmd-Shift-Opt-V: ship the image already on the clipboard.
+default, {SKHD_MODE} < cmd + shift + alt - 5 : /usr/sbin/screencapture -i -c && {ship}
+default, {SKHD_MODE} < cmd + shift + alt - v : {ship}
+
+{SKHD_MODE} < cmd - v [
+    "ghostty" : /usr/bin/osascript -l JavaScript {js}
+    * ~
+]
+"""
+
+
+def _adopt_skhdrc(text: str) -> str:
+    """The main skhdrc with a `.load` of the fragment, and any binding of its own that runs `spark paste` commented out -- the fragment owns those keys now, and a second binding of the same key would shadow it."""
+    load = f'.load "{SKHD_FRAGMENT}"'
+    lines = [
+        f"# (moved to `spark hotkeys install`) {line}"
+        if "spark paste" in line and not line.lstrip().startswith("#")
+        else line
+        for line in text.splitlines()
+    ]
+    if load not in text:
+        lines += [*([""] if text.strip() else []), "# spark screenshot hotkeys (`spark hotkeys install`)", load]
+    return "\n".join(lines) + "\n"
+
+
+def _ensure_ghostty_applescript() -> bool:
+    """`macos-applescript = true` in the Ghostty config. Returns True when it was just added (Ghostty needs a restart)."""
+    if not GHOSTTY_CONFIG.exists():
+        typer.secho(f"{GHOSTTY_CONFIG} not found: add `{GHOSTTY_LINE}` to your Ghostty config by hand", fg="yellow")
+        return False
+    text = GHOSTTY_CONFIG.read_text()
+    added = not any(line.split("#")[0].strip() == GHOSTTY_LINE for line in text.splitlines())
+    if added:
+        GHOSTTY_CONFIG.write_text(
+            text.rstrip("\n")
+            + f"\n\n# spar-cli drives Ghostty tabs via AppleScript (Raycast, hotkeys).\n{GHOSTTY_LINE}\n"
+        )
+    typer.secho(f"{GHOSTTY_CONFIG}: {GHOSTTY_LINE}" + (" (added -- restart Ghostty)" if added else ""), fg="green")
+    return added
+
+
+@hotkeys_app.command("install")
+def hotkeys_install(
+    skhdrc: Path = typer.Option(
+        Path.home() / ".config" / "skhd" / "skhdrc", help="your main skhd config; gets a `.load` line for the fragment"
+    ),
+) -> None:
+    """Write the skhd fragment (~/.config/skhd/spark.skhdrc) and the Ghostty Cmd-V script, `.load` the fragment from your skhdrc, and reload skhd. Idempotent; re-run after upgrading spar-cli."""
+    if platform.system() != "Darwin":
+        raise typer.BadParameter("hotkeys are macOS-only")
+    skhd = shutil.which("skhd") or "/opt/homebrew/bin/skhd"
+    if not Path(skhd).exists():
+        raise typer.BadParameter("skhd not found (brew install koekeishiya/formulae/skhd)")
+    spark = shutil.which("spark") or str(Path.home() / ".local" / "bin" / "spark")
+
+    GHOSTTY_PASTE_SCRIPT.parent.mkdir(parents=True, exist_ok=True)
+    GHOSTTY_PASTE_SCRIPT.write_text(_ghostty_paste_js(skhd))
+    SKHD_FRAGMENT.parent.mkdir(parents=True, exist_ok=True)
+    SKHD_FRAGMENT.write_text(_skhd_fragment(spark, skhd))
+    typer.secho(f"wrote {SKHD_FRAGMENT} and {GHOSTTY_PASTE_SCRIPT}", fg="green")
+
+    main = skhdrc.read_text() if skhdrc.exists() else ""
+    new = _adopt_skhdrc(main)
+    if new != main:
+        target = skhdrc.resolve()  # write through a symlink into a dotfiles repo rather than replacing it
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(new)
+        typer.secho(f"{target}: now loads {SKHD_FRAGMENT} (old `spark paste` bindings commented out)", fg="green")
+
+    restart = _ensure_ghostty_applescript()
+    subprocess.run([skhd, "--reload"], check=False)
+    typer.secho(
+        "skhd reloaded. Cmd-Shift-Opt-5 captures + ships; then Cmd-V in a Spark Ghostty tab pastes the remote path, Cmd-V elsewhere the image."
+        + (" Restart Ghostty first (AppleScript was just enabled)." if restart else ""),
+        fg="green",
+    )
 
 
 # --------------------------------------------------------------------------- chrome
@@ -1492,20 +1713,7 @@ def raycast_install() -> None:
     ssh_config.write_text(_replace_block(old, SSH_BLOCK_BEGIN, SSH_BLOCK_END, _ssh_control_block(c)))
     typer.secho(f"~/.ssh/config: Host {CTL_HOST} -> {c.target}:{c.port} (ControlMaster)", fg="green")
 
-    restart = False
-    if GHOSTTY_CONFIG.exists():
-        text = GHOSTTY_CONFIG.read_text()
-        if not any(line.split("#")[0].strip() == GHOSTTY_LINE for line in text.splitlines()):
-            GHOSTTY_CONFIG.write_text(
-                text.rstrip("\n")
-                + f"\n\n# Raycast drives tabs via AppleScript (`spark raycast install`).\n{GHOSTTY_LINE}\n"
-            )
-            restart = True
-        typer.secho(
-            f"{GHOSTTY_CONFIG}: {GHOSTTY_LINE}" + (" (added -- restart Ghostty)" if restart else ""), fg="green"
-        )
-    else:
-        typer.secho(f"{GHOSTTY_CONFIG} not found: add `{GHOSTTY_LINE}` to your Ghostty config by hand", fg="yellow")
+    _ensure_ghostty_applescript()
 
     if not (RAYCAST_DIR / "package.json").exists():
         raise typer.BadParameter(f"{RAYCAST_DIR} missing -- is this an editable install of the spar-cli checkout?")
