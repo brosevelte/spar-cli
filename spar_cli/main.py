@@ -52,21 +52,19 @@ def _run(
     return subprocess.run(cmd, check=check, text=True, capture_output=capture, input=stdin, cwd=cwd)
 
 
-def _conn_opts(c: cfg.Config) -> list[str]:
+def _conn_opts(c: cfg.Config, *, mux: bool = True) -> list[str]:
     """Port and key, shared by ssh/scp/rsync so every verb takes the same route onto the box."""
     # Multiplex every hop over the persistent master the Raycast `spark-ctl` alias also uses (same
     # ControlPath, so the socket is shared): a hop costs ~30ms instead of a ~300ms handshake. With
     # no master alive the first hop starts one and persists it for 4h; nothing else changes.
-    opts = [
-        "-o",
-        "IdentitiesOnly=yes",
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        "ControlPath=~/.ssh/cm-%r@%h:%p",
-        "-o",
-        "ControlPersist=4h",
-    ]
+    # mux=False is for the launchd tunnel: it starts at the same instant as the `spark ssh` that
+    # kickstarted it, and two masters racing for one socket leaves the loser printing "ControlSocket
+    # ... already exists, disabling multiplexing" -- and a tunnel riding someone else's master dies
+    # with it ("mux_client_request_session: read from master failed"). It gets its own connection.
+    mux_opts = ["ControlMaster=auto", "ControlPath=~/.ssh/cm-%r@%h:%p", "ControlPersist=4h"]
+    opts = ["-o", "IdentitiesOnly=yes"]
+    for o in mux_opts if mux else ["ControlMaster=no", "ControlPath=none"]:
+        opts += ["-o", o]
     if c.identity_file:
         opts += ["-i", str(Path(c.identity_file).expanduser())]
     return opts
@@ -1150,7 +1148,7 @@ def _tunnel_argv(c: cfg.Config) -> list[str]:
         *KEEPALIVE_OPTS,
         "-p",
         str(c.port),
-        *_conn_opts(c),
+        *_conn_opts(c, mux=False),
         "-R",
         f"{c.box_chrome_port}:127.0.0.1:{c.chrome_port}",
         c.target,
