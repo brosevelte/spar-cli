@@ -140,11 +140,17 @@ fi`,
   const boxTop = rules.length >= 2 ? rules[rules.length - 2] : Math.max(0, tail.length - 4);
   let start = boxTop;
   while (start > 0 && start > tail.length - rows && /^\s{2,}\S/.test(plainTail[start - 1]) && !/^\s*$/.test(plainTail[start - 1])) start--;
-  if (needs) start = Math.max(0, tail.length - rows);
+  // Stop at the status line under the box: below it the agents view lists subagents with live
+  // timers, which would change the picture (and make Raycast reload it) every second.
+  let end = rules.length >= 2 ? Math.min(tail.length, rules[rules.length - 1] + 2) : tail.length;
+  if (needs) {
+    start = Math.max(0, tail.length - rows);
+    end = tail.length;
+  }
   return {
     size: Number(sizeLine) || 0,
     chunk,
-    bottom: tail.slice(start),
+    bottom: tail.slice(start, end),
     cursor: pane && cy >= start ? { x: cx, y: cy - start } : undefined,
     needs,
   };
