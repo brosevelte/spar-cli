@@ -107,16 +107,32 @@ const RC = "spark-raycast";
 export const COLS = 92;
 const ROWS = 34;
 
-/** The pane in Raycast's tmux session attached to session `id`, created (or re-created) if needed. */
+/**
+ * The pane in Raycast's tmux session attached to session `id`, created (or re-created) if needed.
+ *
+ * A background session renders ONE screen for everyone attached, at one size: a viewer of another
+ * size gets that frame wrapped into a staircase (seen with Ghostty's agents view at 116 columns and
+ * this pane at 92). So the window takes the size of the layout session's Claude pane -- the other
+ * viewer, when there is one -- and is redrawn (Ctrl-L) whenever its size had to change. A lock
+ * keeps two calls racing from attaching the same session twice.
+ */
 export async function ensureAttached(id: string): Promise<string> {
-  const win = `a-${id}`;
+  const win = `a-${id.replace(/[^0-9a-zA-Z-]/g, "")}`;
+  const layout = q(`${prefs.session}:${prefs.window}.1`);
   const out = await box(`
-tmux has-session -t =${RC} 2>/dev/null || tmux new-session -d -s ${RC} -x ${COLS} -y ${ROWS} -n home
+mkdir -p ~/.cache/spark-raycast
+exec 9>~/.cache/spark-raycast/attach.lock; flock -w 10 9
+size=$(tmux display -p -t ${layout} '#{pane_width} #{pane_height}' 2>/dev/null || echo "${COLS} ${ROWS}")
+w=\${size% *}; h=\${size#* }
+tmux has-session -t =${RC} 2>/dev/null || tmux new-session -d -s ${RC} -x "$w" -y "$h" -n home
 p=$(tmux list-panes -s -t =${RC} -F '#{window_name} #{pane_id} #{pane_dead}' | awk '$1=="${win}" && $3=="0" {print $2; exit}')
 if [ -z "$p" ]; then
-  tmux kill-window -t =${RC}:${win} 2>/dev/null
-  p=$(tmux new-window -d -t =${RC}: -n ${win} -P -F '#{pane_id}' "${CLAUDE.replace(/"/g, "")} attach ${id.replace(/[^0-9a-zA-Z-]/g, "")}")
-  tmux resize-window -t "$p" -x ${COLS} -y ${ROWS} 2>/dev/null
+  while tmux kill-window -t =${RC}:${win} 2>/dev/null; do :; done
+  p=$(tmux new-window -d -t =${RC}: -n ${win} -P -F '#{pane_id}' "${CLAUDE.replace(/"/g, "")} attach ${win.slice(2)}")
+fi
+if [ "$(tmux display -p -t "$p" '#{window_width} #{window_height}')" != "$w $h" ]; then
+  tmux resize-window -t "$p" -x "$w" -y "$h" 2>/dev/null
+  (sleep 1; tmux send-keys -t "$p" C-l) </dev/null >/dev/null 2>&1 9>&- &
 fi
 echo "$p"`);
   return out.trim().split("\n").pop()!;
