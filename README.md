@@ -265,6 +265,7 @@ If it hangs at `Authenticating... Trying none...`, that's Tailscale SSH's `check
 
 | command | what it does |
 |---|---|
+| Claude Terminal | Claude Code in the Raycast popover, like the agents view: sessions with real state, a full-width conversation you type straight into. See "Claude Terminal" below |
 | Go to Claude | focus the mosh tab, select window `claude`, pane 1 |
 | Claude Agents Page | press the agents-view key (↓, a preference) in pane 1 — Claude Code's own "↓ to manage" view |
 | Search Claude Agents | list from `claude agents --json --all` on the box, newest first, state and age as accessories. Enter opens the job in a new tmux window (`claude --resume <session>`); other actions open the agents page, copy the session id or the resume command |
@@ -276,6 +277,31 @@ If it hangs at `Authenticating... Trying none...`, that's Tailscale SSH's `check
 Setup is `spark raycast install`, then restart Ghostty once (the AppleScript flag only takes effect on launch). Latency is what makes this usable: the extension talks to the box through the `spark-ctl` alias, multiplexed over one persistent master connection (`ControlMaster auto`, 4h persist), so a command round-trips in ~40ms instead of a ~500ms handshake. The alias is separate from `Host spark` on purpose — Zed, Rune and mosh never share the socket. The remote login shell is fish, whose quoting isn't POSIX, so the extension never puts a script on ssh's command line: it pipes it to `bash -ls` on stdin.
 
 Preferences (Raycast → Extensions → Spark): ssh alias, tmux session (default `c1`), window (`claude`), Ghostty tab match (`[spark-`), repos directory (`~/src`), agents-view key (`Down`), atuin binary (`/opt/homebrew/bin/atuin`). If your `tmux_session` in the spark config isn't `c1`, set the session preference to match.
+
+### Claude Terminal
+
+Claude Code on the box in a Raycast popover, as text, shaped like the TUI's agents view. Everything shown is a real value: sessions and their state from `claude agents --json`, the summary line and PRs from each job's `~/.claude/jobs/<id>/state.json`, the conversation from the session's transcript JSONL, and Claude's live composer, menus and subagent list from a tmux pane running `claude attach <id>`.
+
+**Sessions** (full width): "New session", then Awaiting input / Working / Completed, each with the summary line the agents view shows, its PRs and its age. Type a task and press Enter to start `claude --bg` in the dropdown's directory; Enter on a session opens it.
+
+**A session** (full width): Claude's input line as a full-width bar, then whatever Claude shows under it (`@` / slash completions, a question, the subagent list), then the conversation as markdown, newest exchange first (a Raycast detail pane always opens at the top). Your messages are grey monospace bars starting with `❯`; Claude's replies start with `●` and render as the markdown they are; each run of tool calls is one summary line in the TUI's words ("Ran 2 shell commands, read 1 file"). The title carries the state, the permission mode and the number of running subagents.
+
+**Typing goes straight in.** A Raycast detail view has no search bar, so every key Raycast can name has an action with a bare (modifier-less) shortcut that sends it to Claude: letters, digits and punctuation (Shift for capitals and symbols), space, Tab, Shift-Return for a newline, and Enter to send. Arrows go to Claude as arrows: ↓ opens the subagent list, ↑↓ move through questions, auto-mode asks and menus. While one of those is open the view shows only it, because Raycast also scrolls a detail view on ↑↓ and with nothing to scroll the arrows only move Claude's highlight. Backspace backs out of an open menu (Raycast keeps Escape). On an empty message, Backspace or ← goes back to the sessions list; sent to Claude, ← would leave the attached view for the agents view. The first bare key Raycast delivers is remembered. Until then, Enter opens a search-bar typing view instead, which is still on ⌘T. `typing.log` in the extension's support directory records each key and attach, for when something doesn't arrive.
+
+| key | does |
+|---|---|
+| typing, ⌫, ↵, ⇧↵ | straight into Claude's composer: type, delete, send, newline |
+| ↑ ↓ ← → / Tab | arrows and Tab in Claude (menus, questions, subagents); ← or ⌫ on an empty message: back to the sessions |
+| ⌃V | paste the clipboard screenshot. It reuses the upload `spark hotkeys` already made when it's the same image, otherwise uploads it to `~/clipboard`. Claude attaches it as `[Image #n]` |
+| ⌘. | Escape: interrupt |
+| ⌘⇧M / ⌘⇧T / ⌘⇧A | cycle mode / show tasks & shells (Ctrl-T) / manage subagents |
+| ⌘⇧O | open the session in Ghostty (a window in the layout session running `claude attach`) |
+
+**How it stays attached.** Raycast keeps its own tmux session on the box (`spark-raycast`, one window per session it has opened). Attaching is shared: Ghostty's agents view sees the same composer, so a draft survives closing Raycast and shows in both. A background session renders one frame for everyone attached, so each window keeps the layout's Claude pane's size: it's checked on every poll, because that pane resizes when a different device attaches. A mismatch turns the screen into a staircase. Every poll also checks the window still runs `claude attach`; if ← ever took it to the agents view (where typing would dispatch new sessions), sending stops and the window is replaced.
+
+**Claude Status** is the menu bar half: a question mark and a count when a session needs you, with Yes / No (answered through the attached pane) and Open right in the menu. In Focus it's the only thing that tells you Claude is waiting, so turn it on.
+
+Raycast's limits, for the record: an extension can't resize its window, set the font (only code blocks are monospace), put anything in the band above a detail view, or set where the view is scrolled to.
 
 ## Images: pasting screenshots into a remote Claude session
 
