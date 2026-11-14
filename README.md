@@ -280,24 +280,24 @@ Preferences (Raycast → Extensions → Spark): ssh alias, tmux session (default
 
 ### Claude Terminal
 
-Claude Code on the box in a Raycast popover, as text. Everything shown is a real value: sessions and their state from `claude agents --json`, the conversation from the session's transcript JSONL, and Claude's live composer from a tmux pane running `claude attach <id>`.
+Claude Code on the box in a Raycast popover, as text, shaped like the TUI's agents view. Everything shown is a real value: sessions and their state from `claude agents --json`, the summary line and PRs from each job's `~/.claude/jobs/<id>/state.json`, the conversation from the session's transcript JSONL, and Claude's live composer from a tmux pane running `claude attach <id>`.
 
-- **Left:** "New session", then every session grouped needs you / working / done. ↑↓ moves between them.
-- **Right:** the selected session. Claude's composer is at the top (the input line with a `▌` cursor, and when it shows one, Claude's own `@` menu, slash menu or question). Under it is the conversation as markdown, newest exchange first: your messages quoted with `❯`, Claude's replies as the markdown they already are, and one line per tool call. Newest first because a Raycast detail pane always opens at the top.
-- **The search bar:** on "New session" it's the task. Enter starts `claude --bg` in the dropdown's directory, as the agents view does. On a session it's a keyboard: it holds two invisible characters, every keystroke goes straight into the session's composer and the bar resets, so what you type appears in the composer on the right. Raycast keeps its own tmux session on the box (`spark-raycast`, one window per session you've opened). Attaching is shared, so Ghostty's agents view sees the same composer and a draft survives closing Raycast.
+**Sessions** (full width): "New session", then Awaiting input / Working / Completed, each with the summary line the agents view shows, its PRs and its age. Type a task and press Enter to start `claude --bg` in the dropdown's directory; Enter on a session opens it.
+
+**A session:**
+- **Right:** Claude's composer at the top (your input with a `▌` cursor, or the whole question when Claude is asking), then the conversation as markdown, newest exchange first (a Raycast detail pane always opens at the top). Your messages are quoted with `❯`, Claude's replies render as the markdown they are, and each tool call is one line.
+- **Left:** Claude's own menu whenever it shows one: `@` file suggestions, slash commands, or the options of a question. ↑↓ moves Raycast's selection *and* Claude's highlight (the right number of Up/Down presses), and Enter accepts: a file is completed with Tab, a command runs with Enter, an option is picked by its number. With no menu, the left lists the exchanges, newest first; selecting one scrolls the conversation to it.
+- **Search bar:** a keyboard. It holds two invisible characters, every keystroke goes straight into Claude's composer and the bar resets. Backspace is one invisible character deleted. Escape clears both and sends nothing; a second Escape goes back to the sessions. Raycast keeps its own tmux session on the box (`spark-raycast`, one window per session you've opened). Attaching is shared: Ghostty's agents view sees the same composer, and a draft survives closing Raycast.
 
 | key | does |
 |---|---|
-| typing / Backspace / Enter | straight into Claude: Enter sends, answers a question, or accepts an `@` / slash suggestion, as the TUI decides |
-| Escape | first press clears the keyboard (nothing is sent); the second closes Raycast |
+| typing / Backspace | straight into Claude's composer |
+| ↑↓ / Enter | move through Claude's menu and accept, or through the exchanges; Enter sends otherwise |
 | ⌘↵ | newline in the composer (backslash-Enter) |
-| ⌃V | paste the clipboard screenshot into the composer: reuses the upload `spark hotkeys` already made when it's the same image, otherwise uploads it to `~/clipboard`. Claude attaches it as `[Image #n]` |
-| ⌘1 / ⌘2 / ⌘3 | pick an option when Claude asks (1 = yes, 3 = no) |
-| ⌘⇧↑ / ⌘⇧↓ / ⌘⇧T | Up / Down / Tab in Claude (move through its menus, accept a suggestion) |
-| ⌘. / ⌘⇧M / ⌘⇧⌫ | Escape (interrupt) / Shift-Tab (cycle mode) / clear the composer |
+| ⌃V | paste the clipboard screenshot. It reuses the upload `spark hotkeys` already made when it's the same image, otherwise uploads it to `~/clipboard` (a typical screenshot is ~400 KB and ~150 ms). Claude attaches it as `[Image #n]` |
+| ⌘. / ⌘⇧T / ⌘⇧M / ⌘⇧⌫ | Escape (interrupt) / Tab / Shift-Tab (cycle mode) / clear the composer |
 | ⌘⇧F | read the conversation full width |
 | ⌘⇧O | open the session in Ghostty (a window in the layout session running `claude attach`) |
-| ⌃X / ⌘⇧C | stop the session / copy its session id |
 
 **Claude Status** is the menu bar half: a question mark and a count when a session needs you, with Yes / No (answered through the attached pane) and Open right in the menu. In Focus it's the only thing that tells you Claude is waiting, so turn it on.
 

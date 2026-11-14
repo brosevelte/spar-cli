@@ -1,50 +1,50 @@
-// "Claude Terminal": Claude Code on the Spark in a Raycast popover, as text.
+// "Claude Terminal": Claude Code on the Spark in a Raycast popover, as text, shaped like the TUI's
+// agents view.
 //
-//   left   -- "New session" and every session from `claude agents`, with its real state
-//             (needs you / working / done). ↑↓ moves between them.
-//   right  -- the selected session: Claude's live composer at the top (from the attached pane, so
-//             Claude's own @ menu, slash menu and questions show there), then the conversation from
-//             its transcript as markdown, newest exchange first.
-//   search -- on "New session", the task to dispatch (`claude --bg`). On a session, a keyboard: it
-//             holds two invisible characters, every keystroke goes straight into the session's
-//             composer and the bar resets, so what you type shows up in the composer on the right.
-//             Backspace arrives as one invisible character deleted; Escape (Raycast clears the
-//             whole bar) as both, and is left alone so a second Escape goes back as usual.
+//   Sessions (full width) -- "New session", then every session from `claude agents` with the summary
+//     line and PRs the agents view shows (~/.claude/jobs/<id>/state.json). Type a task and press
+//     Enter to dispatch a new background session; Enter on a session opens it.
+//   A session -- right: Claude's live composer (from the attached pane) above the conversation from
+//     its transcript, as markdown, newest exchange first. Left: Claude's own menu whenever it shows
+//     one (@ files, slash commands, the options of a question) -- moving the Raycast selection with
+//     ↑↓ moves Claude's highlight, Enter accepts -- and otherwise the exchanges, newest first, which
+//     scroll the conversation to the one selected. Escape twice goes back to the sessions.
 //
-// Sessions, state and the conversation are real values -- `claude agents --json`, the session's
-// transcript JSONL -- and typing goes through a pane in Raycast's own tmux session running
-// `claude attach <id>` (term-backend.ts), which shares the composer with anyone else attached, so a
-// draft lives on the box and shows in Ghostty's agents view too.
+// In a session the search bar is a keyboard: it holds two invisible characters, every keystroke goes
+// straight into the session's composer and the bar resets, so what you type shows up in the composer
+// on the right. Backspace arrives as one invisible character deleted; Escape (Raycast clears the bar)
+// as both, and is left alone so the second Escape goes back. Typing goes through a pane in Raycast's
+// own tmux session running `claude attach <id>` (term-backend.ts), which shares the composer with
+// anyone else attached, so a draft lives on the box and shows in Ghostty's agents view too.
 
 import { Action, ActionPanel, Color, Detail, Icon, Keyboard, LaunchProps, List, LocalStorage, closeMainWindow, showToast, Toast, useNavigation } from "@raycast/api";
 import { useCachedPromise } from "@raycast/utils";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { attachFromClipboard, clipboardState, safeUnlink } from "./clipboard";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { attachFromClipboard, clipboardState, compactForUpload, safeUnlink } from "./clipboard";
 import { Agent, AgentState, Poll, ensureAttached, keys, listAgents, newline, paste, poll, retype, startAgent, stopAgent, upload } from "./term-backend";
-import { Transcript, conversationMarkdown } from "./term-transcript";
+import { composerMarkdown, parseMenu } from "./term-menu";
+import { Transcript, Turn, conversationMarkdown } from "./term-transcript";
 import { focusGhostty, listRepos, prefs, q, repoPath, tmux } from "./spark";
 
 const LIST_POLL_MS = 3000;
 const POLL_MS = 700;
 const NEW_DIR = "newSessionDir";
-const NEW = "new";
-// The bar's resting value on a session: two invisible characters, in two spellings alternated so a
+// The bar's resting value in a session: two invisible characters, in two spellings alternated so a
 // reset is always a real change (React skips a state update to the same value, and the typed
 // character would stay in the bar).
 const KEYBOARD = ["​​", "⁠⁠"];
 const INVISIBLE = /[​⁠]/g;
 
-const STATE: Record<AgentState, { label: string; color: Color; icon: Icon }> = {
-  needs: { label: "needs you", color: Color.Orange, icon: Icon.QuestionMarkCircle },
-  working: { label: "working", color: Color.Green, icon: Icon.CircleProgress },
-  done: { label: "done", color: Color.SecondaryText, icon: Icon.CheckCircle },
+const STATE: Record<AgentState, { label: string; section: string; color: Color; icon: Icon }> = {
+  needs: { label: "needs you", section: "Awaiting input", color: Color.Orange, icon: Icon.QuestionMarkCircle },
+  working: { label: "working", section: "Working", color: Color.Green, icon: Icon.CircleProgress },
+  done: { label: "done", section: "Completed", color: Color.SecondaryText, icon: Icon.CheckCircle },
 };
 
 const short = (p: string) => p.replace(/^\/home\/[^/]+/, "~");
-const plain = (l: string) => l.replace(/\x1b\[[0-9;:?]*[A-Za-z]/g, "").replace(/\x1b\]8;[^\x07\x1b]*(\x07|\x1b\\)/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
 
 function age(ms: number): string {
   const s = Math.max(0, (Date.now() - ms) / 1000);
@@ -53,26 +53,136 @@ function age(ms: number): string {
   return `${Math.round(s / 86400)}d`;
 }
 
-/** Claude's composer area as text: rule lines dropped, the cursor marked, trailing space trimmed. */
-function composerMarkdown(p: Poll | undefined, attached: boolean): string {
-  if (!attached) return "```\nattaching…\n```";
-  if (!p) return "```\n❯\n```";
-  const rows = p.bottom.map(plain);
-  if (p.cursor && rows[p.cursor.y] !== undefined) {
-    const r = rows[p.cursor.y];
-    rows[p.cursor.y] = r.slice(0, p.cursor.x).padEnd(p.cursor.x) + "▌" + r.slice(p.cursor.x + 1);
-  }
-  const shown = rows.filter((r) => !/^\s*─{8,}/.test(r)).map((r) => r.replace(/\s+$/, ""));
-  while (shown.length && !shown[0].trim()) shown.shift();
-  const head = p.needs ? "**Claude is asking** — Enter picks the highlighted option · ⌘1 yes · ⌘3 no\n\n" : "";
-  return head + "```\n" + (shown.join("\n") || "❯ ▌") + "\n```";
-}
-
 /** Open a session in Ghostty: a new window in the layout session running `claude attach`. */
 async function openInGhostty(a: Pick<Agent, "id" | "name" | "cwd">) {
   await closeMainWindow({ clearRootSearch: true });
   await tmux(`new-window -t ${q(prefs.session + ":")} -n ${q(a.name.slice(0, 24))} -c ${q(a.cwd)} ${q(`$HOME/.local/bin/claude attach ${a.id}`)}`);
   await focusGhostty();
+}
+
+// ---------------------------------------------------------------------------- sessions
+
+export default function Command(props: LaunchProps<{ launchContext?: { agentId?: string } }>) {
+  const { push } = useNavigation();
+  const agents = useCachedPromise(listAgents, [], { keepPreviousData: true });
+  const repos = useCachedPromise(listRepos, [], { keepPreviousData: true });
+  const [task, setTask] = useState("");
+  const [dir, setDir] = useState<string>();
+  const launched = useRef(false);
+
+  useEffect(() => {
+    LocalStorage.getItem<string>(NEW_DIR).then((d) => setDir(d ?? (prefs.chatDefaultDir || prefs.srcDir)));
+    const t = setInterval(agents.revalidate, LIST_POLL_MS);
+    return () => clearInterval(t);
+  }, []);
+
+  const open = useCallback((a: Agent) => push(<Session agent={a} onClose={agents.revalidate} />), []);
+
+  useEffect(() => {
+    const want = props.launchContext?.agentId;
+    if (launched.current || !want || !agents.data) return;
+    launched.current = true;
+    const a = agents.data.find((x) => x.id === want);
+    if (a) open(a);
+  }, [agents.data]);
+
+  async function dispatch() {
+    const text = task.trim();
+    if (!text || !dir) return;
+    const toast = await showToast({ style: Toast.Style.Animated, title: "Starting a session…", message: short(dir) });
+    try {
+      const id = await startAgent(dir, text);
+      setTask("");
+      toast.hide();
+      const list = await listAgents();
+      agents.revalidate();
+      const a = list.find((x) => x.id === id);
+      if (a) open(a);
+    } catch (e) {
+      toast.style = Toast.Style.Failure;
+      toast.title = "Couldn't start the session";
+      toast.message = String(e);
+    }
+  }
+
+  const all = agents.data ?? [];
+  const dirs = [...new Set([prefs.chatDefaultDir || prefs.srcDir, "~", ...(repos.data ?? []).map(repoPath)])];
+  const groups: AgentState[] = ["needs", "working", "done"];
+
+  return (
+    <List
+      isLoading={agents.isLoading && !agents.data}
+      filtering={false}
+      searchText={task}
+      onSearchTextChange={setTask}
+      searchBarPlaceholder="Describe a task for a new session…"
+      navigationTitle={`${all.filter((a) => a.state === "needs").length} awaiting input · ${all.filter((a) => a.state === "working").length} working · ${all.filter((a) => a.state === "done").length} completed`}
+      searchBarAccessory={
+        <List.Dropdown
+          tooltip="Where new sessions run"
+          value={dir}
+          onChange={(d) => {
+            setDir(d);
+            LocalStorage.setItem(NEW_DIR, d);
+          }}
+        >
+          {dirs.map((d) => (
+            <List.Dropdown.Item key={d} title={short(d)} value={d} />
+          ))}
+        </List.Dropdown>
+      }
+    >
+      <List.Item
+        id="new"
+        title={task.trim() || "New session"}
+        subtitle={task.trim() ? `Enter starts it in ${short(dir ?? "")}` : `type a task above · runs in ${short(dir ?? "")}`}
+        icon={{ source: Icon.PlusCircle, tintColor: Color.Blue }}
+        actions={
+          <ActionPanel>
+            <Action title="Start New Session" icon={Icon.PlusCircle} onAction={dispatch} />
+          </ActionPanel>
+        }
+      />
+      {groups.map((state) => {
+        const list = all.filter((a) => a.state === state).slice(0, state === "done" ? 60 : undefined);
+        return list.length ? (
+          <List.Section key={state} title={STATE[state].section} subtitle={String(list.length)}>
+            {list.map((a) => (
+              <List.Item
+                key={a.id}
+                id={a.id}
+                title={a.name}
+                subtitle={a.detail}
+                icon={{ source: STATE[a.state].icon, tintColor: STATE[a.state].color }}
+                accessories={[...(a.prs ? [{ text: a.prs === 1 ? "1 PR" : `${a.prs} PRs` }] : []), { text: age(a.updatedAt), tooltip: `${short(a.cwd)} · ${a.raw}` }]}
+                actions={
+                  <ActionPanel>
+                    <Action title="Open" icon={Icon.Message} onAction={() => open(a)} />
+                    {task.trim() && <Action title="Start New Session" icon={Icon.PlusCircle} shortcut={{ modifiers: ["cmd"], key: "return" }} onAction={dispatch} />}
+                    <Action title="Open in Ghostty" icon={Icon.Window} shortcut={{ modifiers: ["cmd", "shift"], key: "o" }} onAction={() => openInGhostty(a)} />
+                    {a.state !== "done" && (
+                      <Action
+                        title="Stop Session"
+                        icon={Icon.Stop}
+                        style={Action.Style.Destructive}
+                        shortcut={Keyboard.Shortcut.Common.Remove}
+                        onAction={async () => {
+                          await stopAgent(a.id);
+                          agents.revalidate();
+                        }}
+                      />
+                    )}
+                    <Action.CopyToClipboard title="Copy Session ID" content={a.sessionId} shortcut={{ modifiers: ["cmd", "shift"], key: "c" }} />
+                    <Action title="Refresh" icon={Icon.ArrowClockwise} shortcut={Keyboard.Shortcut.Common.Refresh} onAction={agents.revalidate} />
+                  </ActionPanel>
+                }
+              />
+            ))}
+          </List.Section>
+        ) : null;
+      })}
+    </List>
+  );
 }
 
 // The `spark hotkeys` screenshot keys upload the image themselves and record its remote path here,
@@ -86,103 +196,74 @@ async function clipboardImageOnBox(): Promise<string> {
   } catch {
     // no hotkey upload to reuse
   }
-  const at = await attachFromClipboard();
+  const at = await compactForUpload(await attachFromClipboard());
   try {
-    return await upload(readFileSync(at.path), at.path.split("/").pop()!);
+    return await upload(readFileSync(at.path), path.basename(at.path));
   } finally {
     safeUnlink(at.path);
   }
 }
 
-// ---------------------------------------------------------------------------- the command
-
-interface Live {
-  transcript: Transcript;
-  offset: number;
-  poll?: Poll;
-  version: number;
-}
+// ---------------------------------------------------------------------------- a session
 
 type Op = { k: "text"; s: string } | { k: "back"; n: number } | { k: "run"; fn: (pane: string) => Promise<void> };
 
-export default function Command(props: LaunchProps<{ launchContext?: { agentId?: string } }>) {
-  const { push } = useNavigation();
-  const agents = useCachedPromise(listAgents, [], { keepPreviousData: true });
-  const repos = useCachedPromise(listRepos, [], { keepPreviousData: true });
-  const [selected, setSelected] = useState<string>(props.launchContext?.agentId ?? NEW);
-  const [task, setTask] = useState("");
+function Session(props: { agent: Agent; onClose: () => void }) {
+  const a = props.agent;
   const [bar, setBar] = useState(KEYBOARD[0]);
-  const resetBar = () => setBar((b) => (b === KEYBOARD[0] ? KEYBOARD[1] : KEYBOARD[0]));
-  const [dir, setDir] = useState<string>();
-  const [, setRender] = useState(0);
-  const panes = useRef(new Map<string, string>()); // agent id -> attached pane
-  const live = useRef(new Map<string, Live>()); // agent id -> conversation state
+  const [pane, setPane] = useState<string>();
+  const [last, setLast] = useState<Poll>();
+  const [turns, setTurns] = useState<Turn[]>([]);
+  const [selected, setSelected] = useState<string>();
+  const transcript = useRef(new Transcript());
+  const offset = useRef(0);
   const ops = useRef<Op[]>([]);
   const pumping = useRef(false);
-  const selectedRef = useRef(selected);
-  selectedRef.current = selected;
+  const paneRef = useRef<string | undefined>(undefined);
+  paneRef.current = pane;
+  const hiRef = useRef(-1); // where Claude's menu highlight is, as far as we've moved it
+  const menuKey = useRef("");
 
-  const all = agents.data ?? [];
-  const agent = all.find((a) => a.id === selected);
-  const agentRef = useRef(agent);
-  agentRef.current = agent;
-  const rerender = () => setRender((n) => n + 1);
+  const resetBar = () => setBar((b) => (b === KEYBOARD[0] ? KEYBOARD[1] : KEYBOARD[0]));
 
-  useEffect(() => {
-    LocalStorage.getItem<string>(NEW_DIR).then((d) => setDir(d ?? (prefs.chatDefaultDir || prefs.srcDir)));
-    const t = setInterval(agents.revalidate, LIST_POLL_MS);
-    return () => clearInterval(t);
-  }, []);
-
-  // ---- the selected session: attach, then poll its transcript and composer together
+  // ---- attach, then poll the transcript and the composer together
   const tick = useCallback(async () => {
-    const a = agentRef.current;
-    if (!a) return;
-    let l = live.current.get(a.id);
-    if (!l) live.current.set(a.id, (l = { transcript: new Transcript(), offset: 0, version: 0 }));
     try {
-      const p = await poll(a.sessionId, l.offset, panes.current.get(a.id), 16);
-      let changed = false;
+      const p = await poll(a.sessionId, offset.current, paneRef.current, 16);
       if (p.chunk) {
-        l.transcript.feed(p.chunk);
-        l.version++;
-        changed = true;
+        transcript.current.feed(p.chunk);
+        setTurns([...transcript.current.turns]);
       }
-      l.offset = p.size || l.offset;
-      if (!l.poll || !sameBottom(l.poll, p)) {
-        l.poll = p;
-        changed = true;
-      }
-      if (changed && selectedRef.current === a.id) rerender();
+      offset.current = p.size || offset.current;
+      setLast((prev) => (prev && sameBottom(prev, p) ? prev : p));
     } catch {
-      // the next tick retries; a dead link shows as a stale composer
+      // the next tick retries
     }
   }, []);
 
   useEffect(() => {
-    if (!agent) return;
-    resetBar();
-    if (!panes.current.has(agent.id)) {
-      ensureAttached(agent.id)
-        .then((p) => {
-          panes.current.set(agent.id, p);
-          tick();
-        })
-        .catch((e) => showToast({ style: Toast.Style.Failure, title: "Couldn't attach", message: String(e) }));
-    }
+    ensureAttached(a.id)
+      .then((p) => {
+        setPane(p);
+        paneRef.current = p;
+        tick();
+      })
+      .catch((e) => showToast({ style: Toast.Style.Failure, title: "Couldn't attach", message: String(e) }));
     tick();
     const t = setInterval(tick, POLL_MS);
-    return () => clearInterval(t);
-  }, [agent?.id]);
+    return () => {
+      clearInterval(t);
+      props.onClose();
+    };
+  }, []);
 
-  // ---- the keyboard: queued, coalesced, in order, to the selected session's pane
+  // ---- the keyboard: queued, coalesced, in order
   const pump = useCallback(async () => {
     if (pumping.current) return;
     pumping.current = true;
     try {
       while (ops.current.length) {
-        const a = agentRef.current;
-        const p = a && panes.current.get(a.id);
+        const p = paneRef.current;
         if (!p) break;
         const op = ops.current.shift()!;
         try {
@@ -208,7 +289,6 @@ export default function Command(props: LaunchProps<{ launchContext?: { agentId?:
   };
 
   function onSearch(t: string) {
-    if (selected === NEW || !agent) return setTask(t);
     const added = t.replace(INVISIBLE, "");
     const marks = (t.match(INVISIBLE) ?? []).length;
     if (added) {
@@ -222,15 +302,15 @@ export default function Command(props: LaunchProps<{ launchContext?: { agentId?:
     }
   }
 
-  const act = (fn: (pane: string) => Promise<void>) => () => {
-    if (!agent || !panes.current.get(agent.id)) {
+  const run = (fn: (pane: string) => Promise<void>) => () => {
+    if (!paneRef.current) {
       showToast({ style: Toast.Style.Failure, title: "Not attached yet" });
       return;
     }
     enqueue({ k: "run", fn });
   };
-  const press = (...k: string[]) => act((p) => keys(p, ...k));
-  const pasteImage = act(async (p) => {
+  const press = (...k: string[]) => run((p) => keys(p, ...k));
+  const pasteImage = run(async (p) => {
     const toast = await showToast({ style: Toast.Style.Animated, title: "Attaching image…" });
     try {
       await paste(p, ` ${await clipboardImageOnBox()} `);
@@ -243,140 +323,112 @@ export default function Command(props: LaunchProps<{ launchContext?: { agentId?:
     }
   });
 
-  async function dispatch() {
-    const text = task.trim();
-    if (!text || !dir) return;
-    const toast = await showToast({ style: Toast.Style.Animated, title: "Starting a session…", message: short(dir) });
-    try {
-      const id = await startAgent(dir, text);
-      setTask("");
-      toast.hide();
-      await agents.revalidate();
-      setSelected(id);
-    } catch (e) {
-      toast.style = Toast.Style.Failure;
-      toast.title = "Couldn't start the session";
-      toast.message = String(e);
-    }
+  // ---- Claude's menu on the left: the Raycast selection drives Claude's highlight
+  const menu = useMemo(() => parseMenu(last), [last]);
+  const key = menu ? menu.items.map((i) => i.label).join("\n") : "";
+  if (key !== menuKey.current) {
+    menuKey.current = key;
+    hiRef.current = menu?.hi ?? -1;
   }
-
-  // ---- the right pane
-  const l = agent ? live.current.get(agent.id) : undefined;
-  const needs = Boolean(l?.poll?.needs) || agent?.state === "needs";
-  const detailFor = (a: Agent) => {
-    if (a.id !== selected) return <List.Item.Detail markdown="" />;
-    const convo = l ? conversationMarkdown(l.transcript.turns) : "_loading…_";
-    return <List.Item.Detail markdown={`${composerMarkdown(l?.poll, panes.current.has(a.id))}\n\n${convo}`} />;
+  const moveTo = (i: number) => {
+    const from = hiRef.current;
+    // An @ menu highlights nothing until the first Down, which lands on the first entry.
+    const n = from < 0 ? i + 1 : i - from;
+    hiRef.current = i;
+    if (n > 0) enqueue({ k: "run", fn: (p) => keys(p, ...Array(n).fill("Down")) });
+    else if (n < 0) enqueue({ k: "run", fn: (p) => keys(p, ...Array(-n).fill("Up")) });
+  };
+  const accept = (i: number) => () => {
+    const item = menu?.items[i];
+    if (!item) return;
+    if (item.kind === "option" && item.digit) return press(item.digit)();
+    if (hiRef.current !== i) moveTo(i);
+    // A file completes into the composer (Tab); a command runs (Enter), as in the TUI.
+    press(item.kind === "file" ? "Tab" : "Enter")();
   };
 
-  const sessionActions = (a: Agent) => (
-    <>
+  // ---- the right pane
+  const newestFirst = useMemo(() => [...turns].reverse(), [turns]);
+  const fromTurn = selected?.startsWith("t:") ? newestFirst.findIndex((t) => "t:" + t.id === selected) : 0;
+  const shownTurns = fromTurn > 0 ? turns.slice(0, turns.length - fromTurn) : turns;
+  const markdown = `${composerMarkdown(last, Boolean(pane))}\n\n${conversationMarkdown(shownTurns)}`;
+  const detail = <List.Item.Detail markdown={markdown} />;
+  const needs = Boolean(last?.needs) || a.state === "needs";
+
+  const actions = (primary: { title: string; icon: Icon; onAction: () => void }) => (
+    <ActionPanel>
+      <Action title={primary.title} icon={primary.icon} onAction={primary.onAction} />
       <ActionPanel.Section title="Claude">
-        <Action title={needs ? "Answer (Enter)" : "Send (Enter)"} icon={Icon.ArrowUpCircle} onAction={press("Enter")} />
-        <Action title="Newline" icon={Icon.Text} shortcut={{ modifiers: ["cmd"], key: "return" }} onAction={act((p) => newline(p))} />
+        <Action title="Send (Enter)" icon={Icon.ArrowUpCircle} shortcut={{ modifiers: ["cmd", "shift"], key: "return" }} onAction={press("Enter")} />
+        <Action title="Newline" icon={Icon.Text} shortcut={{ modifiers: ["cmd"], key: "return" }} onAction={run((p) => newline(p))} />
         <Action title="Paste Screenshot" icon={Icon.Image} shortcut={{ modifiers: ["ctrl"], key: "v" }} onAction={pasteImage} />
-        <Action title="Option 1 (Yes)" icon={Icon.CheckCircle} shortcut={{ modifiers: ["cmd"], key: "1" }} onAction={press("1")} />
-        <Action title="Option 2" icon={Icon.Circle} shortcut={{ modifiers: ["cmd"], key: "2" }} onAction={press("2")} />
-        <Action title="Option 3 (No)" icon={Icon.XMarkCircle} shortcut={{ modifiers: ["cmd"], key: "3" }} onAction={press("3")} />
-        <Action title="Menu Up" icon={Icon.ArrowUp} shortcut={{ modifiers: ["cmd", "shift"], key: "arrowUp" }} onAction={press("Up")} />
-        <Action title="Menu Down" icon={Icon.ArrowDown} shortcut={{ modifiers: ["cmd", "shift"], key: "arrowDown" }} onAction={press("Down")} />
-        <Action title="Tab (Accept Suggestion)" icon={Icon.ArrowRight} shortcut={{ modifiers: ["cmd", "shift"], key: "t" }} onAction={press("Tab")} />
         <Action title="Escape / Interrupt" icon={Icon.Stop} shortcut={{ modifiers: ["cmd"], key: "." }} onAction={press("Escape")} />
+        <Action title="Tab" icon={Icon.ArrowRight} shortcut={{ modifiers: ["cmd", "shift"], key: "t" }} onAction={press("Tab")} />
         <Action title="Cycle Mode" icon={Icon.Switch} shortcut={{ modifiers: ["cmd", "shift"], key: "m" }} onAction={press("BTab")} />
         <Action title="Clear Claude's Input" icon={Icon.Trash} shortcut={{ modifiers: ["cmd", "shift"], key: "backspace" }} onAction={press("C-u")} />
       </ActionPanel.Section>
       <ActionPanel.Section title="Session">
-        <Action.Push
-          title="Read Full Width"
-          icon={Icon.Maximize}
-          shortcut={{ modifiers: ["cmd", "shift"], key: "f" }}
-          target={<Detail navigationTitle={a.name} markdown={l ? conversationMarkdown(l.transcript.turns, 60) : ""} />}
-        />
+        <Action.Push title="Read Full Width" icon={Icon.Maximize} shortcut={{ modifiers: ["cmd", "shift"], key: "f" }} target={<Detail navigationTitle={a.name} markdown={conversationMarkdown(turns, 60)} />} />
         <Action title="Open in Ghostty" icon={Icon.Window} shortcut={{ modifiers: ["cmd", "shift"], key: "o" }} onAction={() => openInGhostty(a)} />
-        {a.state !== "done" && (
-          <Action
-            title="Stop Session"
-            icon={Icon.Stop}
-            style={Action.Style.Destructive}
-            shortcut={Keyboard.Shortcut.Common.Remove}
-            onAction={async () => {
-              await stopAgent(a.id);
-              agents.revalidate();
-            }}
-          />
-        )}
         <Action.CopyToClipboard title="Copy Session ID" content={a.sessionId} shortcut={{ modifiers: ["cmd", "shift"], key: "c" }} />
       </ActionPanel.Section>
-    </>
+    </ActionPanel>
   );
 
-  const groups: [AgentState, Agent[]][] = [
-    ["needs", all.filter((a) => a.state === "needs")],
-    ["working", all.filter((a) => a.state === "working")],
-    ["done", all.filter((a) => a.state === "done").slice(0, 30)],
-  ];
-  const dirs = [...new Set([prefs.chatDefaultDir || prefs.srcDir, "~", ...(repos.data ?? []).map(repoPath)])];
-  const onNew = selected === NEW || !agent;
+  const selectedId = menu ? `m:${Math.max(0, hiRef.current)}` : selected;
 
   return (
     <List
       isShowingDetail
       filtering={false}
       throttle={false}
-      searchText={onNew ? task : bar}
+      searchText={bar}
       onSearchTextChange={onSearch}
-      selectedItemId={selected}
-      onSelectionChange={(id) => id && setSelected(id)}
-      searchBarPlaceholder={onNew ? "Describe a task for a new session… (Enter starts it)" : ""}
-      navigationTitle={agent ? `${agent.name} · ${needs ? "needs you" : STATE[agent.state].label} · ${short(agent.cwd)}` : "Claude on the Spark"}
-      searchBarAccessory={
-        onNew ? (
-          <List.Dropdown
-            tooltip="Where new sessions run"
-            value={dir}
-            onChange={(d) => {
-              setDir(d);
-              LocalStorage.setItem(NEW_DIR, d);
-            }}
-          >
-            {dirs.map((d) => (
-              <List.Dropdown.Item key={d} title={short(d)} value={d} />
-            ))}
-          </List.Dropdown>
-        ) : undefined
-      }
+      searchBarPlaceholder=""
+      selectedItemId={selectedId}
+      onSelectionChange={(id) => {
+        if (!id) return;
+        if (id.startsWith("m:")) {
+          const i = Number(id.slice(2));
+          if (menu && i !== Math.max(0, hiRef.current)) moveTo(i);
+          return;
+        }
+        setSelected(id);
+      }}
+      navigationTitle={`${a.name} · ${needs ? "needs you" : STATE[a.state].label} · ${short(a.cwd)}`}
     >
-      <List.Item
-        id={NEW}
-        title={task.trim() || "New session"}
-        icon={{ source: Icon.PlusCircle, tintColor: Color.Blue }}
-        detail={
-          <List.Item.Detail
-            markdown={`### New session\n\nType the task in the search bar and press **Enter**: it starts \`claude --bg\` in **${short(dir ?? "")}** (change it with the dropdown), like the agents view, and opens it here.\n\nOn a session, the search bar is a keyboard straight into its composer: what you type shows up at the top of the conversation. **Enter** sends (or answers Claude's question), **⌘↵** adds a line, **⌃V** pastes a screenshot, **⌘K** has the rest.`}
-          />
-        }
-        actions={
-          <ActionPanel>
-            <Action title="Start New Session" icon={Icon.PlusCircle} onAction={dispatch} />
-          </ActionPanel>
-        }
-      />
-      {groups.map(([state, list]) =>
-        list.length ? (
-          <List.Section key={state} title={STATE[state].label} subtitle={String(list.length)}>
-            {list.map((a) => (
+      {menu ? (
+        <List.Section title={menu.items[0].kind === "option" ? "Claude is asking" : menu.items[0].kind === "file" ? "@ files — Enter adds" : "Commands — Enter runs"}>
+          {menu.items.map((item, i) => (
+            <List.Item
+              key={`m:${i}:${item.label}`}
+              id={`m:${i}`}
+              title={item.label}
+              subtitle={item.detail}
+              icon={item.kind === "file" ? (item.label.endsWith("/") ? Icon.Folder : Icon.Document) : item.kind === "command" ? Icon.Terminal : item.kind === "option" ? Icon.Circle : Icon.Dot}
+              accessories={item.digit ? [{ text: item.digit }] : undefined}
+              detail={detail}
+              actions={actions({ title: item.kind === "option" ? "Choose" : item.kind === "file" ? "Add" : "Run", icon: Icon.ArrowRight, onAction: accept(i) })}
+            />
+          ))}
+        </List.Section>
+      ) : (
+        <List.Section title={turns.length ? `${turns.length} exchanges` : "Conversation"}>
+          {newestFirst.length ? (
+            newestFirst.slice(0, 40).map((t, i) => (
               <List.Item
-                key={a.id}
-                id={a.id}
-                title={a.name}
-                icon={{ source: STATE[a.state].icon, tintColor: STATE[a.state].color }}
-                accessories={[{ text: age(a.startedAt), tooltip: `${short(a.cwd)} · ${a.raw}` }]}
-                detail={detailFor(a)}
-                actions={<ActionPanel>{sessionActions(a)}</ActionPanel>}
+                key={t.id}
+                id={"t:" + t.id}
+                title={t.prompt.trim().split("\n")[0] || "(image)"}
+                icon={i === 0 ? Icon.Message : Icon.Clock}
+                detail={detail}
+                actions={actions({ title: needs ? "Answer (Enter)" : "Send (Enter)", icon: Icon.ArrowUpCircle, onAction: press("Enter") })}
               />
-            ))}
-          </List.Section>
-        ) : null,
+            ))
+          ) : (
+            <List.Item id="t:none" title="…" detail={detail} actions={actions({ title: "Send (Enter)", icon: Icon.ArrowUpCircle, onAction: press("Enter") })} />
+          )}
+        </List.Section>
       )}
     </List>
   );

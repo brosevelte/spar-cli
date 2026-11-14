@@ -27,22 +27,49 @@ export interface Agent {
   name: string;
   cwd: string;
   startedAt: number;
+  updatedAt: number;
   state: AgentState;
-  raw: string; // claude's own state / status words
+  detail: string; // the one-line summary the agents view shows
+  prs: number;
+  raw: string; // claude's own state / status / tempo words
 }
 
-// `claude agents --json` says working/done and busy/idle; anything else (waiting on input or a
-// permission) counts as needing you. In a conversation, the attached pane's screen confirms it.
-function agentState(state: string, status: string): AgentState {
-  const s = `${state} ${status}`.toLowerCase();
+// `claude agents --json` says working/done and busy/idle, the job's tempo says idle/active/...;
+// anything about waiting on input or a permission counts as needing you. In a conversation the
+// attached pane's screen confirms it.
+function agentState(words: string): AgentState {
+  const s = words.toLowerCase();
   if (/input|wait|block|permission|ask|attention/.test(s)) return "needs";
-  if (/working|busy|running/.test(s)) return "working";
+  if (/working|busy|running|active/.test(s)) return "working";
   return "done";
 }
 
-/** Every Claude session on the box (interactive and background, finished ones too), newest first. */
+/**
+ * Every Claude session on the box (interactive and background, finished ones too), newest first,
+ * joined with its job state (~/.claude/jobs/<id>/state.json): the summary line and PRs the TUI's
+ * agents view shows.
+ */
 export async function listAgents(): Promise<Agent[]> {
-  const out = await box(`${CLAUDE} agents --json --all </dev/null`, 15000);
+  const out = await box(
+    `
+mkdir -p ~/.cache/spark-raycast
+${CLAUDE} agents --json --all </dev/null > ~/.cache/spark-raycast/agents.json
+python3 - <<'PY'
+import json, os
+agents = json.load(open(os.path.expanduser("~/.cache/spark-raycast/agents.json")))
+for a in agents:
+    try:
+        s = json.load(open(os.path.expanduser("~/.claude/jobs/%s/state.json" % a["id"])))
+    except Exception:
+        s = {}
+    a["detail"] = s.get("detail") or ""
+    a["prs"] = sum(1 for c in (s.get("children") or []) if c.get("kind") == "pr")
+    a["tempo"] = s.get("tempo") or ""
+    a["updatedAt"] = s.get("updatedAt") or a.get("startedAt") or 0
+print(json.dumps(agents))
+PY`,
+    15000,
+  );
   const raw = JSON.parse(out || "[]") as Array<Record<string, unknown>>;
   return raw
     .map((a) => ({
@@ -51,10 +78,13 @@ export async function listAgents(): Promise<Agent[]> {
       name: String(a.name ?? a.id),
       cwd: String(a.cwd ?? ""),
       startedAt: Number(a.startedAt ?? 0),
-      state: agentState(String(a.state ?? ""), String(a.status ?? "")),
-      raw: [a.state, a.status].filter(Boolean).join(" · "),
+      updatedAt: typeof a.updatedAt === "number" ? a.updatedAt : Date.parse(String(a.updatedAt)) || Number(a.startedAt ?? 0),
+      state: agentState([a.state, a.status, a.tempo].filter(Boolean).join(" ")),
+      detail: String(a.detail ?? "").replace(/\s+/g, " ").trim(),
+      prs: Number(a.prs ?? 0),
+      raw: [a.state, a.status, a.tempo].filter(Boolean).join(" · "),
     }))
-    .sort((x, y) => y.startedAt - x.startedAt);
+    .sort((x, y) => y.updatedAt - x.updatedAt);
 }
 
 /** Dispatch a new background session with `task` in `dir`, as the agents view does. Returns its short id. */
@@ -144,8 +174,10 @@ fi`,
   // timers, which would change the picture (and make Raycast reload it) every second.
   let end = rules.length >= 2 ? Math.min(tail.length, rules[rules.length - 1] + 2) : tail.length;
   if (needs) {
-    start = Math.max(0, tail.length - rows);
+    // A question is drawn higher up, with blank rows and a closing rule under it: skip those.
     end = tail.length;
+    while (end > 0 && (!plainTail[end - 1].trim() || /^─{8,}/.test(plainTail[end - 1].trim()))) end--;
+    start = Math.max(0, end - rows);
   }
   return {
     size: Number(sizeLine) || 0,

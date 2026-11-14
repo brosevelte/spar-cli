@@ -92,3 +92,22 @@ export async function attachFromClipboard(): Promise<Attachment> {
   await fitForApi(dest);
   return { path: dest, mediaType: "image/png", name: "Screenshot" };
 }
+
+// A typical UI screenshot is a few hundred KB of PNG and uploads in ~150ms -- and is SMALLER as a
+// PNG than as a JPEG (flat colour and text compress better losslessly; measured 390KB vs 477KB).
+// Only a big one -- a full Retina display, a photo -- gains from JPEG, so only those are converted,
+// and the conversion is kept only when it actually shrank the file.
+const COMPACT_ABOVE = 1_500_000;
+
+/** The attachment, as a smaller JPEG when it's a big PNG/TIFF screenshot; otherwise unchanged. */
+export async function compactForUpload(a: Attachment): Promise<Attachment> {
+  if (a.mediaType !== "image/png" || statSync(a.path).size <= COMPACT_ABOVE) return a;
+  const jpg = a.path.replace(/\.[^.]+$/, "") + ".jpg";
+  await run("/usr/bin/sips", ["-s", "format", "jpeg", "-s", "formatOptions", "85", a.path, "--out", jpg]);
+  if (statSync(jpg).size >= statSync(a.path).size) {
+    safeUnlink(jpg);
+    return a;
+  }
+  safeUnlink(a.path);
+  return { ...a, path: jpg, mediaType: "image/jpeg" };
+}
