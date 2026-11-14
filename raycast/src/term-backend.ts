@@ -147,6 +147,18 @@ export interface Poll {
 }
 
 const NEEDS = /Do you want to|Would you like to|❯ 1\. |Esc to cancel|Enter to select/;
+
+/**
+ * Is this (plain) row one of the rules boxing the composer? A run of ─, which may carry a label
+ * ("──── session-name ─"): in a narrow pane the label takes most of the width, so the leading run
+ * can be as short as two.
+ */
+export function isRule(row: string): boolean {
+  const t = row.trim();
+  if (!t.startsWith("──")) return false;
+  if (/^─+$/.test(t)) return t.length >= 3;
+  return /^──+ .+ ─+$/.test(t);
+}
 const plainLine = (l: string) => l.replace(/\x1b\[[0-9;:?]*[A-Za-z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
 
 /**
@@ -156,8 +168,20 @@ const plainLine = (l: string) => l.replace(/\x1b\[[0-9;:?]*[A-Za-z]/g, "").repla
  */
 export async function poll(sessionId: string, offset: number, pane: string | undefined, rows: number): Promise<Poll> {
   const t = pane ? q(pane) : "";
+  // Keep the attached window at the layout Claude pane's size (see ensureAttached): that pane is
+  // resized whenever a different device attaches to the layout session, and a mismatch turns this
+  // pane's screen into a staircase. Checked every poll; resized and redrawn only on a change.
+  const sync = pane
+    ? `want=$(tmux display -p -t ${q(`${prefs.session}:${prefs.window}.1`)} '#{pane_width} #{pane_height}' 2>/dev/null)
+have=$(tmux display -p -t ${t} '#{window_width} #{window_height}' 2>/dev/null)
+if [ -n "$want" ] && [ "$want" != "$have" ]; then
+  tmux resize-window -t ${t} -x "\${want% *}" -y "\${want#* }" 2>/dev/null
+  (sleep 0.5; tmux send-keys -t ${t} C-l) </dev/null >/dev/null 2>&1 &
+fi`
+    : "";
   const out = await box(
     `
+${sync}
 f=$(ls -t ~/.claude/projects/*/${q(sessionId)}.jsonl 2>/dev/null | head -1)
 size=0; [ -n "$f" ] && size=$(stat -c %s "$f")
 echo "$size"
@@ -182,17 +206,17 @@ fi`,
   const plainTail = tail.map(plainLine);
   const needs = NEEDS.test(plainTail.slice(-rows).join("\n"));
   // The composer is boxed by the last two rule lines; a menu (@, /) sits just above the box.
-  const rules = plainTail.map((l, i) => (/^─{8,}/.test(l.trim()) ? i : -1)).filter((i) => i >= 0);
+  const rules = plainTail.map((l, i) => (isRule(l) ? i : -1)).filter((i) => i >= 0);
   const boxTop = rules.length >= 2 ? rules[rules.length - 2] : Math.max(0, tail.length - 4);
   let start = boxTop;
   while (start > 0 && start > tail.length - rows && /^\s{2,}\S/.test(plainTail[start - 1]) && !/^\s*$/.test(plainTail[start - 1])) start--;
-  // Stop at the status line under the box: below it the agents view lists subagents with live
-  // timers, which would change the picture (and make Raycast reload it) every second.
-  let end = rules.length >= 2 ? Math.min(tail.length, rules[rules.length - 1] + 2) : tail.length;
+  // Everything under the box too: the status line, and the subagent list that ↓ ("to manage") moves
+  // through, with its "↑/↓ to select" and ❯ marker.
+  let end = tail.length;
   if (needs) {
     // A question is drawn higher up, with blank rows and a closing rule under it: skip those.
     end = tail.length;
-    while (end > 0 && (!plainTail[end - 1].trim() || /^─{8,}/.test(plainTail[end - 1].trim()))) end--;
+    while (end > 0 && (!plainTail[end - 1].trim() || isRule(plainTail[end - 1]))) end--;
     start = Math.max(0, end - rows);
   }
   return {

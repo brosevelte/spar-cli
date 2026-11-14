@@ -2,14 +2,14 @@
 // menu -- @ files, slash commands, the options of a question -- and the composer itself as text.
 // Pure, so it can be checked against real captures outside Raycast.
 
-import type { Poll } from "./term-backend";
+import { type Poll, isRule } from "./term-backend";
 
 export const plain = (l: string) =>
   l
     .replace(/\x1b\[[0-9;:?]*[A-Za-z]/g, "")
     .replace(/\x1b\]8;[^\x07\x1b]*(\x07|\x1b\\)/g, "")
     .replace(/\x1b\][^\x07]*\x07/g, "");
-const RULE = /^\s*─{8,}/;
+const RULE = { test: isRule };
 
 export interface MenuItem {
   kind: "file" | "command" | "option" | "other";
@@ -107,8 +107,11 @@ export function composerMarkdown(p: Poll | undefined, attached: boolean): string
   if (!attached) return "```\nattaching…\n```";
   if (!p) return "```\n❯ ▌\n```";
   const rows = p.bottom.map(plain);
-  // (Not during a question: the cursor sits on the ❯ that marks the highlighted option.)
-  if (p.cursor && !p.needs && rows[p.cursor.y] !== undefined) {
+  const boxRules = rows.map((r, i) => (RULE.test(r) ? i : -1)).filter((i) => i >= 0);
+  // The cursor is marked only on the input line: in a question or the subagent list the terminal
+  // cursor sits on a list row, where a ▌ reads as a stray glyph.
+  const inInput = (y: number) => boxRules.length >= 2 && y > boxRules[0] && y < boxRules[1];
+  if (p.cursor && !p.needs && rows[p.cursor.y] !== undefined && inInput(p.cursor.y)) {
     const r = [...rows[p.cursor.y]];
     rows[p.cursor.y] = r.slice(0, p.cursor.x).join("").padEnd(p.cursor.x) + "▌" + r.slice(p.cursor.x + 1).join("");
   }
@@ -127,6 +130,25 @@ export function composerMarkdown(p: Poll | undefined, attached: boolean): string
   const rules = rows.map((r, i) => (RULE.test(r) ? i : -1)).filter((i) => i >= 0);
   if (rules.length < 2) return "```\n" + (tidy(rows).join("\n") || "❯ ▌") + "\n```";
   const input = tidy(rows.slice(rules[0] + 1, rules[1]));
-  const status = tidy(rows.slice(rules[1] + 1))[0]?.trim();
-  return "```\n" + (input.join("\n") || "❯ ▌") + "\n```" + (status ? `\n\n${status.replace(/([*_`\\$])/g, "\\$1")}` : "");
+  // Under the box: the status line and the subagent list (which ↓ moves through), monospace so its
+  // columns line up as in the TUI.
+  // A wide pane right-aligns the subagent timers ~150 columns out; squeeze long runs of spaces so the
+  // rows don't wrap in Raycast's narrower block.
+  const below = tidy(rows.slice(rules[1] + 1)).map((r) => r.replace(/ {4,}/g, "   "));
+  return "```\n" + (input.join("\n") || "❯ ▌") + "\n```" + (below.length ? "\n\n```\n" + below.join("\n") + "\n```" : "");
+}
+
+/**
+ * Is Claude showing something the arrow keys move through -- a question, an @ / slash menu, or the
+ * subagent list after ↓ ("↑/↓ to select", a ❯ on the selected row under the composer)? While it is,
+ * the full-width view shows only that, so there is nothing for Raycast to scroll on ↑↓.
+ */
+export function isInteractive(p: Poll | undefined): boolean {
+  if (!p) return false;
+  if (p.needs || parseMenu(p)) return true;
+  const rows = p.bottom.map(plain);
+  const rules = rows.map((r, i) => (RULE.test(r) ? i : -1)).filter((i) => i >= 0);
+  if (rules.length < 2) return false;
+  const below = rows.slice(rules[1] + 1);
+  return below.some((r) => /↑\/↓ to select|enter to (view|select)|esc to (go )?back/i.test(r) || /^\s*❯\s/.test(r));
 }

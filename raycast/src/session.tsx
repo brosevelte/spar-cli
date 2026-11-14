@@ -18,7 +18,7 @@ import path from "node:path";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { attachFromClipboard, clipboardState, compactForUpload, safeUnlink } from "./clipboard";
 import { Agent, Poll, ensureAttached, keys, newline, paste, poll, retype, upload } from "./term-backend";
-import { Menu, composerMarkdown, composerText, parseMenu } from "./term-menu";
+import { Menu, composerMarkdown, composerText, isInteractive, parseMenu } from "./term-menu";
 import { Transcript, conversationMarkdown } from "./term-transcript";
 import { focusGhostty, prefs, q, tmux } from "./spark";
 
@@ -290,6 +290,9 @@ function keyboardActions(store: SessionStore, onKey: () => void, back: () => voi
         onKey();
         // With nothing typed and an empty composer, Backspace goes back to the sessions, as ← does
         // in the TUI's attached view.
+        // In a menu, question or the subagent list, Backspace backs out of it (Escape) -- Raycast
+        // keeps Escape for itself, and leaving the session from inside a menu would be a surprise.
+        if (isInteractive(store.poll) && !typed.current) return store.press("Escape");
         if (!typed.current && !composerText(store.poll)) return back();
         typed.current = [...typed.current].slice(0, -1).join("");
         store.enqueue({ k: "back", n: 1 });
@@ -322,10 +325,18 @@ export function Session(props: { agent: Agent; onClose: () => void }) {
 
   const p = store.poll;
   const menu = parseMenu(p);
-  const hint = bareKeys
-    ? "Type to Claude · ↵ sends · ↑↓ menus, subagents and questions · ⌫ on an empty message goes back"
-    : "**↵ to type** a message · ⌘K for more";
-  const markdown = `${composerWithMenu(p, Boolean(store.pane), menu)}\n\n${hint}\n\n${conversationMarkdown(store.transcript.turns, 30)}`;
+  // Raycast scrolls a Detail on ↑↓ as well as firing the arrow actions, so while Claude shows
+  // something the arrows move through, show only that: with nothing to scroll, the arrows only move
+  // Claude's highlight. The conversation comes back as soon as it closes.
+  const panel = isInteractive(p);
+  const hint = panel
+    ? "↑↓ move · ↵ choose · ⌫ closes it (Escape)"
+    : bareKeys
+      ? "Type to Claude · ↵ sends · ↑↓ menus, subagents and questions · ⌫ on an empty message goes back"
+      : "**↵ to type** a message · ⌘K for more";
+  const markdown = panel
+    ? `${composerWithMenu(p, Boolean(store.pane), menu)}\n\n${hint}`
+    : `${composerWithMenu(p, Boolean(store.pane), menu)}\n\n${hint}\n\n${conversationMarkdown(store.transcript.turns, 30)}`;
   const options = p?.needs ? (menu?.items ?? []) : [];
   const openTyping = () => {
     trace("typing view opened");
