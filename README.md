@@ -288,7 +288,7 @@ A Raycast-AI-style chat with Claude Code on the box: the search bar is the compo
 | ⌘E | the composer: a multi-line editor with `@` completion at the cursor — type `@chatb` anywhere in the message, the matches are listed under it, ⌘1–⌘9 inserts one (a directory keeps completing inside it). ⌘↵ sends. A multi-line draft reopens straight into it |
 | `@` (search bar) | while the text ends in `@<partial>`, the list becomes the chat directory's files and directories on the box (`git ls-files` plus untracked); Enter inserts. On send the box attaches each mentioned file's contents, a directory's listing, or an image, as the TUI does |
 | ⌘Y / ⌘⇧D / ⌘⇧R | approve / deny / deny with a reason — when Claude is waiting, the request is the top item, with the command or diff in the detail pane. Also in the composer, and in the menu bar (Approve / Deny without opening anything) |
-| ⌘⇧V | attach the clipboard image — a screenshot, or an image file copied in Finder. A fresh image on the clipboard is also offered as an item, so after `Cmd-Shift-Ctrl-4` (or the `spark hotkeys` capture) it is one Enter. Images go to Claude as real image blocks, like a paste in the TUI, not as paths |
+| ⌘⇧V | attach the clipboard image — a screenshot, or an image file copied in Finder. Images go to Claude as real image blocks, like a paste in the TUI, not as paths |
 | ⌘. | stop the running turn |
 | ⌘N / ⌘P | new chat in a repo / switch chat |
 | ⌘O | open this chat in Ghostty (`claude --resume` in a new tmux window) |

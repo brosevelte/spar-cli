@@ -13,7 +13,7 @@
 //                    cursor (⌘1–⌘9 insert a suggestion). A multi-line draft reopens straight into it.
 //   @ completion  -- also in the one-line search bar: while it ends in `@<partial>` the list becomes
 //                    the repo's files on the box, Enter inserts.
-//   images        -- ⌘⇧V attaches the clipboard image; a fresh one on the clipboard is offered as an item.
+//   images        -- ⌘⇧V attaches the clipboard image (a screenshot, or a copied image file).
 //   drafts        -- saved per chat on every keystroke with their attachments, so closing Raycast to
 //                    take a screenshot or check something loses nothing.
 
@@ -27,7 +27,6 @@ import {
   Keyboard,
   LaunchProps,
   List,
-  LocalStorage,
   closeMainWindow,
   confirmAlert,
   showToast,
@@ -46,7 +45,6 @@ import {
   Turn,
   attachFromClipboard,
   permissionSummary,
-  clipboardState,
   currentChatId,
   decide,
   files,
@@ -67,8 +65,6 @@ import { Mention, applyMention, candidates, editCursor, mentionAt } from "./chat
 import { focusGhostty, listRepos, newWindow, prefs, repoPath } from "./spark";
 
 const POLL_MS = 1500;
-const CLIP_POLL_MS = 2000;
-const CLIP_SEEN = "clipboardSeen";
 const MENTION_AT_END = /(?:^|\s)@([^\s]*)$/;
 const DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
 
@@ -210,8 +206,6 @@ export default function Command(props: LaunchProps<{ launchContext?: { chatId?: 
   const [pending, setPending] = useState<Pending>();
   const [tick, setTick] = useState(0);
   const [loadError, setLoadError] = useState<string>();
-  const [clip, setClip] = useState<{ count: number; image: boolean }>();
-  const [clipSeen, setClipSeen] = useState<number>();
   const [selected, setSelected] = useState<string>();
   const chatRef = useRef<Chat | undefined>(undefined);
   chatRef.current = chat;
@@ -272,8 +266,7 @@ export default function Command(props: LaunchProps<{ launchContext?: { chatId?: 
 
   useEffect(() => {
     (async () => {
-      const [id, chats, seen] = await Promise.all([currentChatId(), loadChats(), LocalStorage.getItem<number>(CLIP_SEEN)]);
-      setClipSeen(seen);
+      const [id, chats] = await Promise.all([currentChatId(), loadChats()]);
       const wanted = props.launchContext?.chatId ?? id;
       const d = await openChat(chats.find((c) => c.id === wanted) ?? chats[0] ?? newChat(prefs.chatDefaultDir || prefs.srcDir));
       // A long draft lives in the composer: come back to it where you left it.
@@ -318,25 +311,6 @@ export default function Command(props: LaunchProps<{ launchContext?: { chatId?: 
     setSelected(perm ? "permission" : pending ? "pending" : turns[0]?.id);
   }, [turns.length, Boolean(pending), perm?.id]);
 
-  // ---- clipboard watch: a fresh image on the clipboard is offered as an attachment
-  useEffect(() => {
-    let alive = true;
-    const check = () =>
-      clipboardState()
-        .then((s) => alive && setClip(s))
-        .catch(() => undefined);
-    check();
-    const t = setInterval(check, CLIP_POLL_MS);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, []);
-  const markClipSeen = (count: number) => {
-    setClipSeen(count);
-    LocalStorage.setItem(CLIP_SEEN, count);
-  };
-  const offerClipboard = Boolean(clip?.image && clip.count !== clipSeen);
 
   // ---- @ files for this chat's directory (cached across opens)
   const index = useCachedPromise(files, [chat?.cwd ?? ""], { execute: Boolean(chat), keepPreviousData: true });
@@ -353,8 +327,6 @@ export default function Command(props: LaunchProps<{ launchContext?: { chatId?: 
   async function attachClipboard() {
     try {
       const a = await attachFromClipboard();
-      const s = await clipboardState().catch(() => undefined);
-      if (s) markClipSeen(s.count);
       setDraft({ ...draftRef.current, attachments: [...draftRef.current.attachments, a] });
       showToast({ style: Toast.Style.Success, title: "Image attached" });
     } catch (e) {
@@ -492,7 +464,7 @@ export default function Command(props: LaunchProps<{ launchContext?: { chatId?: 
       onSearchTextChange={onSearchTextChange}
       filtering={false}
       throttle={false}
-      isShowingDetail={turns.length > 0 || Boolean(pending) || Boolean(perm) || multiline || draft.attachments.length > 0 || offerClipboard}
+      isShowingDetail={turns.length > 0 || Boolean(pending) || Boolean(perm) || multiline || draft.attachments.length > 0}
       isLoading={!chat || (!result && !loadError) || busy}
       selectedItemId={selected}
       onSelectionChange={(id) => id && setSelected(id)}
@@ -522,7 +494,7 @@ export default function Command(props: LaunchProps<{ launchContext?: { chatId?: 
           />
         </List.Section>
       )}
-      {(multiline || draft.attachments.length > 0 || offerClipboard) && (
+      {(multiline || draft.attachments.length > 0) && (
         <List.Section title="Draft">
           {multiline && (
             <List.Item
@@ -556,22 +528,6 @@ export default function Command(props: LaunchProps<{ launchContext?: { chatId?: 
               }
             />
           ))}
-          {offerClipboard && clip && (
-            <List.Item
-              id="clipboard"
-              title="Attach the image on your clipboard"
-              icon={Icon.Clipboard}
-              accessories={[{ text: "⌘⇧V" }]}
-              detail={<List.Item.Detail markdown="A screenshot or image is on the clipboard. **Enter** attaches it; **⌃X** ignores it." />}
-              actions={
-                <ActionPanel>
-                  <Action title="Attach Clipboard Image" icon={Icon.Image} onAction={attachClipboard} />
-                  <Action title="Ignore This Image" icon={Icon.EyeDisabled} shortcut={Keyboard.Shortcut.Common.Remove} onAction={() => markClipSeen(clip.count)} />
-                  {chatActions}
-                </ActionPanel>
-              }
-            />
-          )}
         </List.Section>
       )}
       <List.Section title={chat?.title ?? "Chat"} subtitle={chat?.cwd}>
