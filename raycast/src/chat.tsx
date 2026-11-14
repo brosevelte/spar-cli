@@ -6,11 +6,14 @@
 // turn is a detached `claude -p` on the box (chat-backend.ts, assets/spark-chat.py), so a chat is an
 // ordinary Claude Code session with the box's tools, MCPs, memory and CLAUDE.md.
 //
-// Three things the composer does that a Raycast search bar doesn't on its own:
-//   @ completion  -- while the text ends in `@<partial>`, the list turns into the repo's files and
-//                    directories on the box; Enter inserts the path (a directory keeps you drilling).
-//   images        -- Cmd-Shift-V attaches the clipboard image (a screenshot, or a copied image file);
-//                    a fresh screenshot on the clipboard is offered as an item so it is one Enter.
+// What the popover adds to a plain Raycast list:
+//   approvals     -- when the permission mode (auto) would ask, the request shows at the top of the
+//                    chat (and in the composer and the menu bar): ⌘Y approves, ⌘⇧D denies.
+//   composer      -- ⌘E, or Enter with nothing typed: a multi-line TextArea with @ completion at the
+//                    cursor (⌘1–⌘9 insert a suggestion). A multi-line draft reopens straight into it.
+//   @ completion  -- also in the one-line search bar: while it ends in `@<partial>` the list becomes
+//                    the repo's files on the box, Enter inserts.
+//   images        -- ⌘⇧V attaches the clipboard image; a fresh one on the clipboard is offered as an item.
 //   drafts        -- saved per chat on every keystroke with their attachments, so closing Raycast to
 //                    take a screenshot or check something loses nothing.
 
@@ -22,6 +25,7 @@ import {
   Form,
   Icon,
   Keyboard,
+  LaunchProps,
   List,
   LocalStorage,
   closeMainWindow,
@@ -36,11 +40,15 @@ import {
   Attachment,
   Chat,
   Draft,
+  FileIndex,
+  Permission,
   ShowResult,
   Turn,
   attachFromClipboard,
+  permissionSummary,
   clipboardState,
   currentChatId,
+  decide,
   files,
   loadChats,
   loadDraft,
@@ -51,15 +59,18 @@ import {
   send,
   setCurrentChat,
   show,
+  status,
   stop,
   upsertChat,
 } from "./chat-backend";
+import { Mention, applyMention, candidates, editCursor, mentionAt } from "./chat-mention";
 import { focusGhostty, listRepos, newWindow, prefs, repoPath } from "./spark";
 
 const POLL_MS = 1500;
 const CLIP_POLL_MS = 2000;
 const CLIP_SEEN = "clipboardSeen";
 const MENTION_AT_END = /(?:^|\s)@([^\s]*)$/;
+const DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
 
 // ---------------------------------------------------------------------------- rendering
 
@@ -68,6 +79,10 @@ const noMath = (s: string) => s.replace(/\$/g, "\\$");
 const firstLine = (s: string, n = 80) => {
   const l = s.trim().split("\n")[0] ?? "";
   return l.length > n ? l.slice(0, n) + "…" : l;
+};
+const fence = (body: string, lang = "") => {
+  const ticks = body.includes("```") ? "````" : "```";
+  return `${ticks}${lang}\n${body}\n${ticks}`;
 };
 
 function ago(ts: string | null): string {
@@ -103,7 +118,7 @@ function turnMarkdown(t: Turn, opts: { working: boolean; error: string | null })
   }
   flush();
   if (opts.working) out.push("_Claude is working…_");
-  if (opts.error) out.push(`**⚠ The last turn failed**\n\n\`\`\`\n${opts.error}\n\`\`\``);
+  if (opts.error) out.push(`**⚠ The last turn failed**\n\n${fence(opts.error)}`);
   return out.join("\n\n");
 }
 
@@ -113,31 +128,69 @@ const lastReply = (t: Turn) =>
     .map((p) => p.text)
     .join("\n\n");
 
-// ---------------------------------------------------------------------------- @ completion
-
-/** Higher is better; -1 is no match. Basename hits beat path hits beat a scattered subsequence. */
-function score(p: string, q: string): number {
-  const lp = p.toLowerCase();
-  const lq = q.toLowerCase();
-  const trimmed = lp.endsWith("/") ? lp.slice(0, -1) : lp;
-  const base = trimmed.slice(trimmed.lastIndexOf("/") + 1);
-  if (base.startsWith(lq)) return 4000 - p.length;
-  if (base.includes(lq)) return 3000 - p.length;
-  if (lp.startsWith(lq)) return 2500 - p.length;
-  if (lp.includes(lq)) return 2000 - p.length;
-  let i = 0;
-  for (const ch of lp) if (ch === lq[i] && ++i === lq.length) return 1000 - p.length;
-  return -1;
+function permissionMarkdown(p: Permission): string {
+  const i = p.input as Record<string, unknown>;
+  const str = (k: string) => (typeof i[k] === "string" ? (i[k] as string) : undefined);
+  const out = [`## Claude wants to use \`${p.tool}\``];
+  if (str("description")) out.push(`_${noMath(str("description")!)}_`);
+  if (p.tool === "Bash" && str("command")) {
+    out.push(fence(str("command")!, "bash"));
+  } else if (str("file_path") && (str("old_string") !== undefined || str("new_string") !== undefined)) {
+    const minus = (str("old_string") ?? "").split("\n").map((l) => "- " + l);
+    const plus = (str("new_string") ?? "").split("\n").map((l) => "+ " + l);
+    out.push(`\`${str("file_path")}\``, fence([...minus, ...plus].join("\n"), "diff"));
+  } else if (str("file_path") && str("content") !== undefined) {
+    const lines = str("content")!.split("\n");
+    out.push(`\`${str("file_path")}\` (${lines.length} lines)`, fence(lines.slice(0, 80).join("\n") + (lines.length > 80 ? "\n…" : "")));
+  } else {
+    out.push(fence(JSON.stringify(i, null, 2), "json"));
+  }
+  out.push("**⌘Y** approve · **⌘⇧D** deny · **⌘⇧R** deny with a reason");
+  return out.join("\n\n");
 }
 
-function candidates(all: string[], q: string): string[] {
-  if (!q) return all.filter((p) => !p.replace(/\/$/, "").includes("/")).slice(0, 80);
-  return all
-    .map((p) => [p, score(p, q)] as const)
-    .filter(([, s]) => s >= 0)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 80)
-    .map(([p]) => p);
+/** Approve / deny actions, the same in every view that can show a pending request. */
+function PermissionActions(props: { chat: Chat; perm: Permission; onDone: () => void; primary?: boolean }) {
+  const { push, pop } = useNavigation();
+  const answer = async (behavior: "allow" | "deny", message?: string) => {
+    try {
+      await decide(props.chat.id, props.perm.id, behavior, message);
+      showToast({ style: Toast.Style.Success, title: behavior === "allow" ? "Approved" : "Denied" });
+    } catch (e) {
+      showToast({ style: Toast.Style.Failure, title: "Couldn't answer", message: String(e) });
+    }
+    props.onDone();
+  };
+  return (
+    <ActionPanel.Section title="Approval">
+      <Action title="Approve" icon={{ source: Icon.CheckCircle, tintColor: Color.Green }} shortcut={{ modifiers: ["cmd"], key: "y" }} onAction={() => answer("allow")} />
+      <Action
+        title="Deny"
+        icon={{ source: Icon.XMarkCircle, tintColor: Color.Red }}
+        shortcut={{ modifiers: ["cmd", "shift"], key: "d" }}
+        onAction={() => answer("deny")}
+      />
+      <Action
+        title="Deny with Reason…"
+        icon={Icon.SpeechBubble}
+        shortcut={{ modifiers: ["cmd", "shift"], key: "r" }}
+        onAction={() =>
+          push(
+            <Form
+              navigationTitle="Deny with a reason"
+              actions={
+                <ActionPanel>
+                  <Action.SubmitForm title="Deny" onSubmit={(v: { reason: string }) => (pop(), answer("deny", v.reason))} />
+                </ActionPanel>
+              }
+            >
+              <Form.TextArea id="reason" title="Reason" placeholder="Claude sees this instead of running it" autoFocus />
+            </Form>,
+          )
+        }
+      />
+    </ActionPanel.Section>
+  );
 }
 
 // ---------------------------------------------------------------------------- the command
@@ -149,7 +202,7 @@ interface Pending {
   at: number;
 }
 
-export default function Command() {
+export default function Command(props: LaunchProps<{ launchContext?: { chatId?: string } }>) {
   const { push, pop } = useNavigation();
   const [chat, setChat] = useState<Chat>();
   const [draft, setDraftState] = useState<Draft>({ text: "", attachments: [] });
@@ -162,8 +215,46 @@ export default function Command() {
   const [selected, setSelected] = useState<string>();
   const chatRef = useRef<Chat | undefined>(undefined);
   chatRef.current = chat;
+  const draftRef = useRef<Draft>(draft);
+  draftRef.current = draft;
 
-  // ---- load the current chat and its draft (the draft is what makes jumping away safe)
+  const setDraft = useCallback((d: Draft) => {
+    setDraftState(d);
+    const c = chatRef.current;
+    if (c) saveDraft(c.id, d);
+  }, []);
+  const refresh = useCallback(() => setTick((x) => x + 1), []);
+  const resultRef = useRef<ShowResult | undefined>(undefined);
+  resultRef.current = result;
+
+  // ---- send: used by the search bar and the composer
+  const doSend = useCallback(async (text: string, attachments: Attachment[]) => {
+    const c = chatRef.current;
+    if (!c || (!text.trim() && !attachments.length)) return false;
+    setPending({ prompt: text, images: attachments.length, before: resultRef.current?.turns.length ?? 0, at: Date.now() });
+    setDraft({ text: "", attachments: [] });
+    try {
+      await send(c, text, attachments);
+      attachments.forEach((a) => safeUnlink(a.path));
+      const next = { ...c, title: c.title === "New chat" && text.trim() ? firstLine(text, 60) : c.title, updatedAt: Date.now() };
+      await upsertChat(next);
+      setChat(next);
+      refresh();
+      return true;
+    } catch (e) {
+      setPending(undefined);
+      setDraft({ text, attachments }); // nothing is lost on a failed send
+      showToast({ style: Toast.Style.Failure, title: "Send failed", message: String(e) });
+      return false;
+    }
+  }, []);
+  const openComposer = useCallback(() => {
+    const c = chatRef.current;
+    if (!c) return;
+    push(<Composer chat={c} initial={draftRef.current} onChange={setDraft} onSend={async (t, a) => (await doSend(t, a)) && pop()} />);
+  }, []);
+
+  // ---- load the chat (the launch context's, else the current one) and its draft
   const openChat = useCallback(async (c: Chat) => {
     await upsertChat(c);
     await setCurrentChat(c.id);
@@ -171,22 +262,23 @@ export default function Command() {
     setPending(undefined);
     setLoadError(undefined);
     setSelected(undefined);
+    chatRef.current = c;
     setChat(c);
-    setDraftState(await loadDraft(c.id));
+    const d = await loadDraft(c.id);
+    setDraftState(d);
+    draftRef.current = d;
+    return d;
   }, []);
 
   useEffect(() => {
     (async () => {
       const [id, chats, seen] = await Promise.all([currentChatId(), loadChats(), LocalStorage.getItem<number>(CLIP_SEEN)]);
       setClipSeen(seen);
-      await openChat(chats.find((c) => c.id === id) ?? chats[0] ?? newChat(prefs.chatDefaultDir || prefs.srcDir));
+      const wanted = props.launchContext?.chatId ?? id;
+      const d = await openChat(chats.find((c) => c.id === wanted) ?? chats[0] ?? newChat(prefs.chatDefaultDir || prefs.srcDir));
+      // A long draft lives in the composer: come back to it where you left it.
+      if (d.text.includes("\n")) openComposer();
     })();
-  }, []);
-
-  const setDraft = useCallback((d: Draft) => {
-    setDraftState(d);
-    const c = chatRef.current;
-    if (c) saveDraft(c.id, d);
   }, []);
 
   // ---- the conversation: read once per chat, then every POLL_MS while a turn is in flight
@@ -215,15 +307,16 @@ export default function Command() {
   const busy = Boolean(result?.running || pending);
   useEffect(() => {
     if (!busy) return;
-    const t = setTimeout(() => setTick((x) => x + 1), POLL_MS);
+    const t = setTimeout(refresh, POLL_MS);
     return () => clearTimeout(t);
   }, [busy, tick]);
 
-  // Newest exchange selected whenever one arrives; otherwise selection is yours.
+  // Newest exchange -- or a new approval request -- is selected when it arrives; otherwise selection is yours.
   const turns = useMemo(() => [...(result?.turns ?? [])].reverse(), [result]);
+  const perm = result?.permission ?? null;
   useEffect(() => {
-    setSelected(pending ? "pending" : turns[0]?.id);
-  }, [turns.length, Boolean(pending)]);
+    setSelected(perm ? "permission" : pending ? "pending" : turns[0]?.id);
+  }, [turns.length, Boolean(pending), perm?.id]);
 
   // ---- clipboard watch: a fresh image on the clipboard is offered as an attachment
   useEffect(() => {
@@ -247,7 +340,8 @@ export default function Command() {
 
   // ---- @ files for this chat's directory (cached across opens)
   const index = useCachedPromise(files, [chat?.cwd ?? ""], { execute: Boolean(chat), keepPreviousData: true });
-  const mention = MENTION_AT_END.exec(draft.text);
+  const multiline = draft.text.includes("\n");
+  const mention = multiline ? null : MENTION_AT_END.exec(draft.text);
   const mentionQuery = mention ? mention[1] : undefined;
   const fileItems = useMemo(
     () => (mentionQuery === undefined || !index.data ? [] : candidates([...index.data.dirs, ...index.data.files], mentionQuery)),
@@ -261,7 +355,7 @@ export default function Command() {
       const a = await attachFromClipboard();
       const s = await clipboardState().catch(() => undefined);
       if (s) markClipSeen(s.count);
-      setDraft({ ...draft, attachments: [...draft.attachments, a] });
+      setDraft({ ...draftRef.current, attachments: [...draftRef.current.attachments, a] });
       showToast({ style: Toast.Style.Success, title: "Image attached" });
     } catch (e) {
       showToast({ style: Toast.Style.Failure, title: "No image to attach", message: String(e) });
@@ -277,39 +371,22 @@ export default function Command() {
     const m = MENTION_AT_END.exec(draft.text);
     if (!m) return;
     const start = draft.text.length - m[1].length - 1;
-    // A directory keeps the completion open so you can keep drilling; a file ends it with a space.
     setDraft({ ...draft, text: draft.text.slice(0, start) + "@" + p + (p.endsWith("/") ? "" : " ") });
   }
 
-  async function doSend(text = draft.text) {
-    if (!chat) return;
-    if (!text.trim() && !draft.attachments.length) return;
-    if (result?.running || pending) {
+  function sendFromBar() {
+    if (busy) {
       showToast({ style: Toast.Style.Failure, title: "Claude is still working", message: "Stop it (⌘.) or wait — your draft is kept." });
       return;
     }
-    const sent: Draft = { text, attachments: draft.attachments };
-    setPending({ prompt: text, images: sent.attachments.length, before: result?.turns.length ?? 0, at: Date.now() });
-    setDraft({ text: "", attachments: [] });
-    try {
-      await send(chat, text, sent.attachments);
-      sent.attachments.forEach((a) => safeUnlink(a.path));
-      const c = { ...chat, title: chat.title === "New chat" && text.trim() ? firstLine(text, 60) : chat.title, updatedAt: Date.now() };
-      await upsertChat(c);
-      setChat(c);
-      setTick((x) => x + 1);
-    } catch (e) {
-      setPending(undefined);
-      setDraft(sent); // nothing is lost on a failed send
-      showToast({ style: Toast.Style.Failure, title: "Send failed", message: String(e) });
-    }
+    doSend(draft.text, draft.attachments);
   }
 
   async function doStop() {
     if (!chat) return;
     const stopped = await stop(chat.id).catch(() => false);
     showToast({ style: stopped ? Toast.Style.Success : Toast.Style.Failure, title: stopped ? "Stopped" : "Nothing running" });
-    setTick((x) => x + 1);
+    refresh();
   }
 
   async function openInGhostty() {
@@ -323,28 +400,30 @@ export default function Command() {
     await focusGhostty();
   }
 
+  // Typing into the search bar while the draft is multi-line would clobber it: the keystrokes are
+  // appended instead and the composer opens, where the whole draft is.
+  function onSearchTextChange(text: string) {
+    if (!multiline) return setDraft({ ...draft, text });
+    if (!text) return;
+    setDraft({ ...draft, text: draft.text + text });
+    openComposer();
+  }
+
+  const hasDraft = Boolean(draft.text.trim() || draft.attachments.length);
+  const sendAction = (shortcut?: Keyboard.Shortcut) =>
+    hasDraft ? <Action title="Send to Claude" icon={Icon.ArrowUpCircle} shortcut={shortcut} onAction={sendFromBar} /> : null;
+  const composeAction = (primary: boolean) => (
+    <Action title={primary ? "Write a Message" : "Open Composer"} icon={Icon.Pencil} shortcut={primary ? undefined : { modifiers: ["cmd"], key: "e" }} onAction={openComposer} />
+  );
+
   const chatActions = (
     <>
+      {chat && perm && <PermissionActions chat={chat} perm={perm} onDone={refresh} />}
       <ActionPanel.Section title="Chat">
-        <Action
-          title="Paste Image"
-          icon={Icon.Image}
-          shortcut={{ modifiers: ["cmd", "shift"], key: "v" }}
-          onAction={attachClipboard}
-        />
-        <Action.Push
-          title="Edit Draft (Multi-line)"
-          icon={Icon.Pencil}
-          shortcut={{ modifiers: ["cmd"], key: "e" }}
-          target={<DraftForm draft={draft} onChange={setDraft} onSend={(t) => (pop(), doSend(t))} />}
-        />
+        {composeAction(false)}
+        <Action title="Paste Image" icon={Icon.Image} shortcut={{ modifiers: ["cmd", "shift"], key: "v" }} onAction={attachClipboard} />
         {busy && <Action title="Stop Claude" icon={Icon.Stop} shortcut={{ modifiers: ["cmd"], key: "." }} onAction={doStop} />}
-        <Action
-          title="New Chat…"
-          icon={Icon.PlusCircle}
-          shortcut={Keyboard.Shortcut.Common.New}
-          onAction={() => push(<NewChat onPick={(c) => (pop(), openChat(c))} />)}
-        />
+        <Action title="New Chat…" icon={Icon.PlusCircle} shortcut={Keyboard.Shortcut.Common.New} onAction={() => push(<NewChat onPick={(c) => (pop(), openChat(c))} />)} />
         <Action
           title="Switch Chat…"
           icon={Icon.List}
@@ -352,9 +431,9 @@ export default function Command() {
           onAction={() => push(<SwitchChat current={chat?.id} onPick={(c) => (pop(), openChat(c))} />)}
         />
         <Action title="Open in Ghostty" icon={Icon.Terminal} shortcut={Keyboard.Shortcut.Common.Open} onAction={openInGhostty} />
-        <Action title="Refresh" icon={Icon.ArrowClockwise} shortcut={Keyboard.Shortcut.Common.Refresh} onAction={() => setTick((x) => x + 1)} />
+        <Action title="Refresh" icon={Icon.ArrowClockwise} shortcut={Keyboard.Shortcut.Common.Refresh} onAction={refresh} />
       </ActionPanel.Section>
-      {(draft.text || draft.attachments.length > 0) && (
+      {hasDraft && (
         <ActionPanel.Section>
           <Action
             title="Discard Draft"
@@ -370,29 +449,21 @@ export default function Command() {
       )}
     </>
   );
-
-  const sendAction = (shortcut?: Keyboard.Shortcut) =>
-    draft.text.trim() || draft.attachments.length ? (
-      <Action title="Send to Claude" icon={Icon.ArrowUpCircle} shortcut={shortcut} onAction={() => doSend()} />
-    ) : null;
+  // Enter: send what's typed, or open the composer when nothing is.
+  const primary = () => (hasDraft && !multiline ? sendAction() : composeAction(true));
 
   // ---------------------------------------------------------------------------- views
 
-  const placeholder = chat
-    ? `${busy ? "Claude is working… draft your next message" : "Message Claude"} · ${chat.cwd.replace(/^.*\//, "") || chat.cwd}  (@ for files)`
-    : "Loading…";
+  const where = chat ? chat.cwd.replace(/^.*\//, "") || chat.cwd : "";
+  const placeholder = !chat
+    ? "Loading…"
+    : multiline
+      ? `Long draft (${draft.text.split("\n").length} lines) — Enter or ⌘E to keep writing`
+      : `${perm ? "Claude is waiting for your approval (⌘Y)" : busy ? "Claude is working… draft your next message" : "Message Claude"} · ${where}  (@ files, Enter on empty: composer)`;
 
   if (mentionQuery !== undefined) {
     return (
-      <List
-        searchText={draft.text}
-        onSearchTextChange={(text) => setDraft({ ...draft, text })}
-        filtering={false}
-        throttle={false}
-        isLoading={index.isLoading}
-        searchBarPlaceholder={placeholder}
-        navigationTitle={chat?.title}
-      >
+      <List searchText={draft.text} onSearchTextChange={onSearchTextChange} filtering={false} throttle={false} isLoading={index.isLoading} searchBarPlaceholder={placeholder} navigationTitle={chat?.title}>
         <List.Section title={`Files in ${index.data?.cwd ?? chat?.cwd ?? ""}`} subtitle={String(fileItems.length)}>
           {fileItems.map((p) => (
             <List.Item
@@ -417,11 +488,11 @@ export default function Command() {
 
   return (
     <List
-      searchText={draft.text}
-      onSearchTextChange={(text) => setDraft({ ...draft, text })}
+      searchText={multiline ? "" : draft.text}
+      onSearchTextChange={onSearchTextChange}
       filtering={false}
       throttle={false}
-      isShowingDetail={turns.length > 0 || Boolean(pending) || draft.attachments.length > 0 || offerClipboard}
+      isShowingDetail={turns.length > 0 || Boolean(pending) || Boolean(perm) || multiline || draft.attachments.length > 0 || offerClipboard}
       isLoading={!chat || (!result && !loadError) || busy}
       selectedItemId={selected}
       onSelectionChange={(id) => id && setSelected(id)}
@@ -429,13 +500,45 @@ export default function Command() {
       navigationTitle={chat?.title}
       actions={
         <ActionPanel>
-          {sendAction()}
+          {primary()}
           {chatActions}
         </ActionPanel>
       }
     >
-      {(draft.attachments.length > 0 || offerClipboard) && (
-        <List.Section title="Attachments">
+      {chat && perm && (
+        <List.Section title="Waiting for you">
+          <List.Item
+            id="permission"
+            title={permissionSummary(perm)}
+            icon={{ source: Icon.QuestionMarkCircle, tintColor: Color.Orange }}
+            accessories={[{ tag: { value: "approve?", color: Color.Orange } }]}
+            detail={<List.Item.Detail markdown={permissionMarkdown(perm)} />}
+            actions={
+              <ActionPanel>
+                <PermissionActions chat={chat} perm={perm} onDone={refresh} />
+                {chatActions}
+              </ActionPanel>
+            }
+          />
+        </List.Section>
+      )}
+      {(multiline || draft.attachments.length > 0 || offerClipboard) && (
+        <List.Section title="Draft">
+          {multiline && (
+            <List.Item
+              id="draft"
+              title={firstLine(draft.text) || "Draft"}
+              icon={Icon.Pencil}
+              accessories={[{ text: `${draft.text.split("\n").length} lines` }]}
+              detail={<List.Item.Detail markdown={noMath(draft.text)} />}
+              actions={
+                <ActionPanel>
+                  {composeAction(true)}
+                  {chatActions}
+                </ActionPanel>
+              }
+            />
+          )}
           {draft.attachments.map((a) => (
             <List.Item
               key={a.path}
@@ -446,14 +549,8 @@ export default function Command() {
               detail={<List.Item.Detail markdown={`![${a.name}](${encodeURI("file://" + a.path)})`} />}
               actions={
                 <ActionPanel>
-                  {sendAction()}
-                  <Action
-                    title="Remove Attachment"
-                    icon={Icon.XMarkCircle}
-                    style={Action.Style.Destructive}
-                    shortcut={Keyboard.Shortcut.Common.Remove}
-                    onAction={() => removeAttachment(a)}
-                  />
+                  {primary()}
+                  <Action title="Remove Attachment" icon={Icon.XMarkCircle} style={Action.Style.Destructive} shortcut={Keyboard.Shortcut.Common.Remove} onAction={() => removeAttachment(a)} />
                   {chatActions}
                 </ActionPanel>
               }
@@ -469,13 +566,7 @@ export default function Command() {
               actions={
                 <ActionPanel>
                   <Action title="Attach Clipboard Image" icon={Icon.Image} onAction={attachClipboard} />
-                  {sendAction({ modifiers: ["cmd"], key: "return" })}
-                  <Action
-                    title="Ignore This Image"
-                    icon={Icon.EyeDisabled}
-                    shortcut={Keyboard.Shortcut.Common.Remove}
-                    onAction={() => markClipSeen(clip.count)}
-                  />
+                  <Action title="Ignore This Image" icon={Icon.EyeDisabled} shortcut={Keyboard.Shortcut.Common.Remove} onAction={() => markClipSeen(clip.count)} />
                   {chatActions}
                 </ActionPanel>
               }
@@ -491,7 +582,7 @@ export default function Command() {
             icon={{ source: Icon.CircleProgress, tintColor: Color.Orange }}
             accessories={[{ text: "sending" }]}
             detail={<List.Item.Detail markdown={`> ${noMath(pending.prompt).split("\n").join("\n> ")}\n\n---\n\n_Starting Claude on the box…_`} />}
-            actions={<ActionPanel>{chatActions}</ActionPanel>}
+            actions={<ActionPanel>{primary()}{chatActions}</ActionPanel>}
           />
         )}
         {turns.map((t, i) => {
@@ -503,13 +594,7 @@ export default function Command() {
               key={t.id}
               id={t.id}
               title={firstLine(t.prompt) || (t.images ? "🖼 image" : "…")}
-              icon={
-                working
-                  ? { source: Icon.CircleProgress, tintColor: Color.Orange }
-                  : err
-                    ? { source: Icon.Warning, tintColor: Color.Red }
-                    : Icon.Message
-              }
+              icon={working ? { source: Icon.CircleProgress, tintColor: Color.Orange } : err ? { source: Icon.Warning, tintColor: Color.Red } : Icon.Message}
               accessories={[
                 ...(t.images ? [{ icon: Icon.Image, text: String(t.images) }] : []),
                 ...(t.files.length ? [{ icon: Icon.Paperclip, text: String(t.files.length) }] : []),
@@ -518,13 +603,9 @@ export default function Command() {
               detail={<List.Item.Detail markdown={turnMarkdown(t, { working, error: err })} />}
               actions={
                 <ActionPanel>
-                  {sendAction()}
+                  {primary()}
                   <Action.CopyToClipboard title="Copy Reply" content={lastReply(t)} shortcut={Keyboard.Shortcut.Common.Copy} />
-                  <Action.CopyToClipboard
-                    title="Copy Session ID"
-                    content={chat?.id ?? ""}
-                    shortcut={{ modifiers: ["cmd", "shift"], key: "i" }}
-                  />
+                  <Action.CopyToClipboard title="Copy Session ID" content={chat?.id ?? ""} shortcut={{ modifiers: ["cmd", "shift"], key: "i" }} />
                   {chatActions}
                 </ActionPanel>
               }
@@ -532,48 +613,144 @@ export default function Command() {
           );
         })}
       </List.Section>
-      {chat && result && turns.length === 0 && !pending && (
-        <List.EmptyView
-          icon={Icon.Message}
-          title="Message Claude on the Spark"
-          description={`Runs in ${chat.cwd}. Type below, @ for files, ⌘⇧V to paste an image, ⌘E for a multi-line draft.`}
-        />
+      {chat && result && turns.length === 0 && !pending && !multiline && (
+        <List.EmptyView icon={Icon.Message} title="Message Claude on the Spark" description={`Runs in ${chat.cwd}. Type below for a quick one, Enter for the composer, @ for files, ⌘⇧V to paste an image.`} />
       )}
       {loadError && <List.EmptyView icon={Icon.Warning} title="Can't reach the box" description={loadError} />}
     </List>
   );
 }
 
-// ---------------------------------------------------------------------------- sub-views
+// ---------------------------------------------------------------------------- the composer
 
-function DraftForm(props: { draft: Draft; onChange: (d: Draft) => void; onSend: (text: string) => void }) {
-  const [text, setText] = useState(props.draft.text);
+/**
+ * The multi-line composer. A pushed view gets its props once, so it keeps its own copy of the draft
+ * (written back through onChange on every keystroke), loads the @ index itself (the cache is shared
+ * with the list) and polls the chat's status so an approval request shows up here too.
+ */
+function Composer(props: { chat: Chat; initial: Draft; onChange: (d: Draft) => void; onSend: (text: string, attachments: Attachment[]) => Promise<unknown> }) {
+  const [text, setText] = useState(props.initial.text);
+  const [attachments, setAttachments] = useState(props.initial.attachments);
+  const [mention, setMention] = useState<Mention>();
+  const [st, setSt] = useState<{ running: boolean; permission: Permission | null }>();
+  const [sending, setSending] = useState(false);
+  const prev = useRef(props.initial.text);
+  const index = useCachedPromise((cwd: string) => files(cwd), [props.chat.cwd], { keepPreviousData: true });
+
+  const save = (t: string, a: Attachment[]) => props.onChange({ text: t, attachments: a });
+
+  useEffect(() => {
+    let alive = true;
+    const poll = () =>
+      status([props.chat.id])
+        .then((s) => alive && setSt(s[props.chat.id]))
+        .catch(() => undefined);
+    poll();
+    const t = setInterval(poll, 2000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
+
+  function onText(next: string) {
+    const cursor = editCursor(prev.current, next);
+    prev.current = next;
+    setText(next);
+    setMention(mentionAt(next, cursor));
+    save(next, attachments);
+  }
+
+  const suggestions = useMemo(() => {
+    if (!mention || !index.data) return [];
+    const all = [...(index.data as FileIndex).dirs, ...(index.data as FileIndex).files];
+    if (!mention.query.endsWith("/") && all.includes(mention.query)) return []; // a complete file path: done
+    return candidates(all, mention.query, 9);
+  }, [mention, index.data]);
+
+  function insert(p: string) {
+    if (!mention) return;
+    const r = applyMention(text, mention, p);
+    prev.current = r.text;
+    setText(r.text);
+    // A directory keeps completing inside it; a file is done.
+    setMention(p.endsWith("/") ? mentionAt(r.text, r.cursor) : undefined);
+    save(r.text, attachments);
+  }
+
+  async function paste() {
+    try {
+      const a = await attachFromClipboard();
+      const next = [...attachments, a];
+      setAttachments(next);
+      save(text, next);
+      showToast({ style: Toast.Style.Success, title: "Image attached" });
+    } catch (e) {
+      showToast({ style: Toast.Style.Failure, title: "No image to attach", message: String(e) });
+    }
+  }
+
+  async function submit() {
+    if (st?.running) {
+      showToast({ style: Toast.Style.Failure, title: "Claude is still working", message: "Your draft is kept; send when the turn finishes." });
+      return;
+    }
+    setSending(true);
+    await props.onSend(text, attachments);
+    setSending(false);
+  }
+
+  const perm = st?.permission ?? null;
+  const state = perm ? `⏸ waiting for approval — ${permissionSummary(perm)}` : st?.running ? "Claude is working…" : "Claude is idle";
+
   return (
     <Form
-      navigationTitle="Draft"
+      navigationTitle={props.chat.title}
+      isLoading={sending || index.isLoading}
       actions={
         <ActionPanel>
-          <Action.SubmitForm title="Send to Claude" icon={Icon.ArrowUpCircle} onSubmit={() => props.onSend(text)} />
+          <Action title="Send to Claude" icon={Icon.ArrowUpCircle} shortcut={{ modifiers: ["cmd"], key: "return" }} onAction={submit} />
+          {suggestions.length > 0 && (
+            <ActionPanel.Section title="Insert @ mention">
+              {suggestions.map((p, i) => (
+                <Action key={p} title={`@${p}`} icon={p.endsWith("/") ? Icon.Folder : Icon.Document} shortcut={{ modifiers: ["cmd"], key: DIGITS[i] }} onAction={() => insert(p)} />
+              ))}
+            </ActionPanel.Section>
+          )}
+          {perm && <PermissionActions chat={props.chat} perm={perm} onDone={() => setSt({ running: true, permission: null })} />}
+          <ActionPanel.Section>
+            <Action title="Paste Image" icon={Icon.Image} shortcut={{ modifiers: ["cmd", "shift"], key: "v" }} onAction={paste} />
+            {attachments.length > 0 && (
+              <Action
+                title="Remove Last Image"
+                icon={Icon.XMarkCircle}
+                shortcut={Keyboard.Shortcut.Common.Remove}
+                onAction={() => {
+                  const last = attachments[attachments.length - 1];
+                  safeUnlink(last.path);
+                  const next = attachments.slice(0, -1);
+                  setAttachments(next);
+                  save(text, next);
+                }}
+              />
+            )}
+          </ActionPanel.Section>
         </ActionPanel>
       }
     >
-      <Form.TextArea
-        id="text"
-        title="Message"
-        value={text}
-        onChange={(t) => {
-          setText(t);
-          props.onChange({ ...props.draft, text: t });
-        }}
-        enableMarkdown
-        autoFocus
-      />
-      <Form.Description
-        text={`${props.draft.attachments.length} image(s) attached. ⌘↵ sends. @ completion lives in the main composer: Esc back to it.`}
-      />
+      <Form.Description title="Claude" text={`${state} · ${props.chat.cwd}`} />
+      <Form.TextArea id="text" title="Message" value={text} onChange={onText} placeholder="Type @ for files · ⌘↵ sends · ⌘⇧V pastes an image" autoFocus />
+      {suggestions.length > 0 && (
+        <Form.Description title={`@${mention?.query ?? ""}`} text={suggestions.map((p, i) => `⌘${i + 1}  ${p}`).join("\n")} />
+      )}
+      {mention && suggestions.length === 0 && !index.isLoading && <Form.Description title={`@${mention.query}`} text="no matching files" />}
+      {attachments.length > 0 && <Form.Description title="Images" text={attachments.map((a) => `🖼 ${a.name}`).join("\n")} />}
+      {perm && <Form.Description title="Approve?" text={`${permissionSummary(perm)}\n⌘Y approve · ⌘⇧D deny · ⌘⇧R deny with reason`} />}
     </Form>
   );
 }
+
+// ---------------------------------------------------------------------------- pickers
 
 function NewChat(props: { onPick: (c: Chat) => void }) {
   const repos = useCachedPromise(listRepos, [], { keepPreviousData: true });
@@ -587,12 +764,7 @@ function NewChat(props: { onPick: (c: Chat) => void }) {
       </List.Section>
       <List.Section title="Repos">
         {(repos.data ?? []).map((r) => (
-          <List.Item
-            key={r}
-            title={r}
-            icon={Icon.Code}
-            actions={<ActionPanel><Action title="Start Chat Here" onAction={() => props.onPick(newChat(repoPath(r)))} /></ActionPanel>}
-          />
+          <List.Item key={r} title={r} icon={Icon.Code} actions={<ActionPanel><Action title="Start Chat Here" onAction={() => props.onPick(newChat(repoPath(r)))} /></ActionPanel>} />
         ))}
       </List.Section>
     </List>

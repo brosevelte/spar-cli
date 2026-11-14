@@ -11,9 +11,16 @@ transcript (~/.claude/projects/<dir>/<sid>.jsonl), which `show` reads back as co
 is therefore an ordinary Claude Code session: `claude --resume <sid>` opens it in the TUI.
 
   send   {cwd, sid, text, images:[{media_type, data}], mode, model}   start a turn (refused while one runs)
-  show   {sid, limit}                                                  turns + running state + last error
+  show   {sid, limit}                                                  turns + running state + last error + pending approval
+  decide {sid, id, behavior, message}                                  answer a pending approval (allow / deny)
+  status {sids}                                                        running + pending approval for several chats (menu bar)
   files  {cwd}                                                         candidates for @ completion
   stop   {sid}                                                         interrupt the running turn
+
+Approvals: each turn runs with `--permission-prompt-tool mcp__spark_chat__approve`, served by this same
+file in `mcp <sid>` mode (a minimal stdio MCP server). When the permission mode (auto, by default)
+would ask, Claude calls that tool; it writes <sid>.perm.json and waits for the Mac to write the
+decision file, which is what the popover's Approve / Deny do.
 """
 
 import base64
@@ -51,7 +58,23 @@ def paths(sid):
         "pid": os.path.join(STATE, f"{sid}.pid"),
         "log": os.path.join(STATE, f"{sid}.log"),
         "turn": os.path.join(STATE, f"{sid}.turn.jsonl"),
+        "perm": os.path.join(STATE, f"{sid}.perm.json"),
+        "decision": os.path.join(STATE, f"{sid}.decision.json"),
     }
+
+
+def write_atomic(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def pending_permission(sid):
+    try:
+        return json.load(open(paths(sid)["perm"]))
+    except (OSError, ValueError):
+        return None
 
 
 def transcript(sid):
@@ -134,13 +157,21 @@ def cmd_send(req):
     with open(p["turn"], "w") as f:
         f.write(json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n")
     argv = [CLAUDE, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
-    argv += ["--permission-mode", req.get("mode") or "acceptEdits"]
+    argv += ["--permission-mode", req.get("mode") or "auto"]
+    # Prompts the mode would show go to this file's MCP mode, i.e. to the popover's Approve / Deny.
+    mcp = {"mcpServers": {"spark_chat": {"type": "stdio", "command": sys.executable, "args": [os.path.abspath(__file__), "mcp", sid]}}}
+    argv += ["--mcp-config", json.dumps(mcp), "--permission-prompt-tool", "mcp__spark_chat__approve"]
     if req.get("model"):
         argv += ["--model", req["model"]]
     # The first turn names the session so the Mac knows its id before Claude has written anything.
     argv += ["--resume", sid] if transcript(sid) else ["--session-id", sid]
+    for stale in (p["perm"], p["decision"]):
+        if os.path.exists(stale):
+            os.unlink(stale)
     env = dict(os.environ)
     env["PATH"] = os.pathsep.join([os.path.join(HOME, ".local", "bin"), os.path.join(HOME, ".local", "node", "bin"), env.get("PATH", "")])
+    # An approval waits for you, possibly for hours: don't let the MCP call time out under it.
+    env["MCP_TOOL_TIMEOUT"] = str(7 * 24 * 3600 * 1000)
     with open(p["turn"]) as stdin, open(p["log"], "w") as log:
         # Its own process session: the ssh that started it exits now, and nothing reaches it on hangup.
         proc = subprocess.Popen(argv, cwd=cwd, stdin=stdin, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
@@ -223,7 +254,93 @@ def cmd_show(req):
     error = None
     if not running:
         error = last_error(sid)
-    out({"running": running, "title": title, "turns": turns[-limit:], "error": error, "transcript": t})
+    permission = pending_permission(sid) if running else None
+    out({"running": running, "title": title, "turns": turns[-limit:], "error": error, "permission": permission, "transcript": t})
+
+
+def cmd_decide(req):
+    sid, p = req["sid"], paths(req["sid"])
+    perm = pending_permission(sid)
+    if not perm or perm.get("id") != req.get("id"):
+        return out({"ok": False, "error": "that request is no longer pending"})
+    write_atomic(p["decision"], {"id": perm["id"], "behavior": req.get("behavior", "deny"), "message": req.get("message") or ""})
+    out({"ok": True})
+
+
+def cmd_status(req):
+    res = {}
+    for sid in req.get("sids", []):
+        running = running_pid(sid) is not None
+        res[sid] = {"running": running, "permission": pending_permission(sid) if running else None}
+    out(res)
+
+
+# --------------------------------------------------------------------------- MCP approval server
+
+
+def mcp_serve(sid):
+    """Minimal stdio MCP server with one tool, `approve`: the --permission-prompt-tool for this chat."""
+    p = paths(sid)
+    tool = {
+        "name": "approve",
+        "description": "Ask the user (in the Raycast chat on their Mac) to approve or deny a tool call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"tool_name": {"type": "string"}, "input": {"type": "object"}, "tool_use_id": {"type": "string"}},
+            "required": ["tool_name", "input"],
+        },
+    }
+
+    def reply(mid, result):
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+        sys.stdout.flush()
+
+    def ask(args):
+        rid = args.get("tool_use_id") or f"r{time.time_ns()}"
+        write_atomic(p["perm"], {"id": rid, "tool": args.get("tool_name"), "input": args.get("input") or {}, "ts": int(time.time())})
+        try:
+            while True:
+                try:
+                    d = json.load(open(p["decision"]))
+                    if d.get("id") == rid:
+                        break
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.3)
+        finally:
+            for f_ in (p["perm"], p["decision"]):
+                try:
+                    os.unlink(f_)
+                except OSError:
+                    pass
+        if d.get("behavior") == "allow":
+            return {"behavior": "allow", "updatedInput": args.get("input") or {}}
+        return {"behavior": "deny", "message": d.get("message") or "The user denied this from the Raycast chat."}
+
+    for line in sys.stdin:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        method, mid = msg.get("method"), msg.get("id")
+        if mid is None:
+            continue  # notifications (initialized, cancelled) need no answer
+        if method == "initialize":
+            reply(mid, {
+                "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2024-11-05"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "spark_chat", "version": "1"},
+            })
+        elif method == "tools/list":
+            reply(mid, {"tools": [tool]})
+        elif method == "tools/call":
+            decision = ask((msg.get("params") or {}).get("arguments") or {})
+            reply(mid, {"content": [{"type": "text", "text": json.dumps(decision)}]})
+        elif method == "ping":
+            reply(mid, {})
+        else:
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"no method {method}"}}) + "\n")
+            sys.stdout.flush()
 
 
 def last_error(sid):
@@ -282,8 +399,10 @@ def cmd_stop(req):
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "mcp":
+        return mcp_serve(sys.argv[2])
     req = json.loads(sys.stdin.read() or "{}")
-    handler = {"send": cmd_send, "show": cmd_show, "files": cmd_files, "stop": cmd_stop}.get(req.get("cmd"))
+    handler = {"send": cmd_send, "show": cmd_show, "decide": cmd_decide, "status": cmd_status, "files": cmd_files, "stop": cmd_stop}.get(req.get("cmd"))
     if not handler:
         return out({"ok": False, "error": f"unknown command {req.get('cmd')!r}"})
     handler(req)

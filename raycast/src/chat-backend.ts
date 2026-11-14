@@ -58,11 +58,26 @@ export interface Turn {
   parts: Part[];
 }
 
+export interface Permission {
+  id: string;
+  tool: string;
+  input: Record<string, unknown>;
+  ts: number;
+}
+
+/** One line for lists and the menu bar: what Claude wants to do. */
+export function permissionSummary(p: Permission): string {
+  const i = p.input as Record<string, unknown>;
+  const what = String(i.command ?? i.file_path ?? i.path ?? i.url ?? i.pattern ?? "").trim().split("\n")[0];
+  return `${p.tool}${what ? ": " + (what.length > 70 ? what.slice(0, 70) + "…" : what) : ""}`;
+}
+
 export interface ShowResult {
   running: boolean;
   title: string | null;
   turns: Turn[];
   error: string | null;
+  permission: Permission | null;
 }
 
 export interface Attachment {
@@ -78,10 +93,22 @@ export async function show(sid: string): Promise<ShowResult> {
 export async function send(chat: Chat, text: string, attachments: Attachment[]): Promise<void> {
   const images = attachments.map((a) => ({ media_type: a.mediaType, data: readFileSync(a.path).toString("base64") }));
   const r = await call<{ ok: boolean; error?: string }>(
-    { cmd: "send", sid: chat.id, cwd: chat.cwd, text, images, mode: prefs.chatPermissionMode || "acceptEdits", model: prefs.chatModel || undefined },
+    { cmd: "send", sid: chat.id, cwd: chat.cwd, text, images, mode: prefs.chatPermissionMode || "auto", model: prefs.chatModel || undefined },
     90000,
   );
   if (!r.ok) throw new Error(r.error ?? "send failed");
+}
+
+/** Answer a pending approval. A deny's message reaches Claude as the reason. */
+export async function decide(sid: string, id: string, behavior: "allow" | "deny", message?: string): Promise<void> {
+  const r = await call<{ ok: boolean; error?: string }>({ cmd: "decide", sid, id, behavior, message });
+  if (!r.ok) throw new Error(r.error ?? "decision failed");
+}
+
+export type Status = Record<string, { running: boolean; permission: Permission | null }>;
+
+export async function status(sids: string[]): Promise<Status> {
+  return call<Status>({ cmd: "status", sids });
 }
 
 export async function stop(sid: string): Promise<boolean> {

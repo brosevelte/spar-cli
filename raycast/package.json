@@ -13,8 +13,15 @@
     {
       "name": "chat",
       "title": "Chat with Claude",
-      "description": "Talk to Claude Code on the Spark from a popover: @ file completion, pasted screenshots, drafts that survive closing Raycast",
+      "description": "Talk to Claude Code on the Spark from a popover: approve/deny prompts, @ file completion (also multi-line), pasted screenshots, drafts that survive closing Raycast",
       "mode": "view"
+    },
+    {
+      "name": "chat-menubar",
+      "title": "Claude Approvals",
+      "description": "Menu bar: shows when a Claude chat on the Spark is waiting for approval (approve or deny from the menu) or working",
+      "mode": "menu-bar",
+      "interval": "15s"
     },
     {
       "name": "goto-claude",
@@ -119,16 +126,20 @@
     {
       "name": "chatPermissionMode",
       "title": "Chat permission mode",
-      "description": "Claude's permission mode for chat turns. Nothing can answer a permission prompt from Raycast yet, so anything that would ask is denied and Claude says so",
+      "description": "Claude's permission mode for chat turns. Whatever it would ask about shows up as an Approve / Deny request in the chat and the Claude Approvals menu bar item",
       "type": "dropdown",
       "data": [
         {
-          "title": "Accept edits (default)",
+          "title": "Auto (default)",
+          "value": "auto"
+        },
+        {
+          "title": "Accept edits",
           "value": "acceptEdits"
         },
         {
-          "title": "Default (ask = deny)",
-          "value": "default"
+          "title": "Manual (ask for everything)",
+          "value": "manual"
         },
         {
           "title": "Plan only",
@@ -139,7 +150,7 @@
           "value": "bypassPermissions"
         }
       ],
-      "default": "acceptEdits",
+      "default": "auto",
       "required": false
     },
     {

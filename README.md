@@ -280,23 +280,24 @@ Preferences (Raycast → Extensions → Spark): ssh alias, tmux session (default
 
 ### Chat with Claude
 
-A Raycast-AI-style chat with Claude Code on the box: the search bar is the composer, each exchange is a list item, the reply (with one line per tool call) is the detail pane. Bind it a hotkey in Raycast and it is a popover over whatever you're doing.
+A Raycast-AI-style chat with Claude Code on the box: the search bar is the composer, each exchange is a list item, the reply (with one line per tool call) is the detail pane. Bind it a hotkey in Raycast and it is a popover over whatever you're doing. Turn on the **Claude Approvals** menu bar command too: in Focus nothing else tells you Claude is waiting.
 
 | key | does |
 |---|---|
-| Enter | send (refused while a turn is running — your draft stays) |
-| `@` | while the text ends in `@<partial>`, the list becomes the chat directory's files and directories on the box (`git ls-files` plus untracked); Enter inserts the path, and a directory keeps you drilling. On send the box attaches each mentioned file's contents, a directory's listing, or an image, as the TUI does |
+| Enter | with a short message typed: send. With nothing typed: open the composer |
+| ⌘E | the composer: a multi-line editor with `@` completion at the cursor — type `@chatb` anywhere in the message, the matches are listed under it, ⌘1–⌘9 inserts one (a directory keeps completing inside it). ⌘↵ sends. A multi-line draft reopens straight into it |
+| `@` (search bar) | while the text ends in `@<partial>`, the list becomes the chat directory's files and directories on the box (`git ls-files` plus untracked); Enter inserts. On send the box attaches each mentioned file's contents, a directory's listing, or an image, as the TUI does |
+| ⌘Y / ⌘⇧D / ⌘⇧R | approve / deny / deny with a reason — when Claude is waiting, the request is the top item, with the command or diff in the detail pane. Also in the composer, and in the menu bar (Approve / Deny without opening anything) |
 | ⌘⇧V | attach the clipboard image — a screenshot, or an image file copied in Finder. A fresh image on the clipboard is also offered as an item, so after `Cmd-Shift-Ctrl-4` (or the `spark hotkeys` capture) it is one Enter. Images go to Claude as real image blocks, like a paste in the TUI, not as paths |
-| ⌘E | edit the draft multi-line (⌘↵ sends from there) |
 | ⌘. | stop the running turn |
 | ⌘N / ⌘P | new chat in a repo / switch chat |
 | ⌘O | open this chat in Ghostty (`claude --resume` in a new tmux window) |
 
 **Drafts persist.** Each chat's text and attached images are saved on every keystroke, so closing Raycast to take a screenshot or check something loses nothing.
 
-**How it runs.** Claude never runs under Raycast — Raycast unloads a command when its window closes. Each turn is a detached `claude -p --input-format stream-json` in its own process session on the box, writing the session's normal transcript, which the extension reads back. So a chat is an ordinary Claude Code session (the box's tools, MCPs, memory and CLAUDE.md), and closing the popover mid-turn doesn't stop it. The box side is `raycast/assets/spark-chat.py`; the extension uploads it to `~/.cache/spark-chat/h-<hash>.py` on first use, so there is nothing to install. Don't send from Raycast and from the TUI to the same session at once — two writers fork it.
+**Approvals.** Turns run in the "Chat permission mode" preference — `auto` by default, like the TUI in auto mode. What that mode would ask about goes to `--permission-prompt-tool mcp__spark_chat__approve`, a tiny MCP server in the same helper file: it parks the request in `~/.cache/spark-chat/<session>.perm.json` and waits (for hours if need be) for the decision the popover or menu bar writes back. A deny reaches Claude as the reason, and it doesn't retry.
 
-**Permissions.** Nothing can answer a permission prompt from the popover yet, so turns run in the "Chat permission mode" preference (default `acceptEdits`) and anything that would ask is denied, and Claude says so. "Chat model" and "Chat directory" are the other preferences.
+**How it runs.** Claude never runs under Raycast — Raycast unloads a command when its window closes. Each turn is a detached `claude -p --input-format stream-json` in its own process session on the box, writing the session's normal transcript, which the extension reads back. So a chat is an ordinary Claude Code session (the box's tools, MCPs, memory and CLAUDE.md), and closing the popover mid-turn doesn't stop it. The box side is `raycast/assets/spark-chat.py`; the extension uploads it to `~/.cache/spark-chat/h-<hash>.py` on first use, so there is nothing to install. Don't send from Raycast and from the TUI to the same session at once — two writers fork it.
 
 ## Images: pasting screenshots into a remote Claude session
 
