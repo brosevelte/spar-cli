@@ -18,7 +18,7 @@ import path from "node:path";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { attachFromClipboard, clipboardState, compactForUpload, safeUnlink } from "./clipboard";
 import { Agent, Poll, ensureAttached, keys, newline, paste, poll, retype, upload } from "./term-backend";
-import { Menu, composerMarkdown, composerText, isInteractive, modeName, parseMenu, subagentChips } from "./term-menu";
+import { Menu, composerMarkdown, composerText, isInteractive, modeName, parseMenu, subagents } from "./term-menu";
 import { Transcript, conversationMarkdown } from "./term-transcript";
 import { focusGhostty, prefs, q, tmux } from "./spark";
 
@@ -240,7 +240,9 @@ function composerWithMenu(p: Poll | undefined, attached: boolean, menu: Menu | u
 const title = (a: Agent, store: SessionStore) => {
   const state = store.poll?.needs || a.state === "needs" ? "needs you" : a.state === "working" ? "working" : "done";
   const mode = modeName(store.poll);
-  return [a.name, state, mode, short(a.cwd)].filter(Boolean).join(" · ");
+  // Running subagents as a count (the full list is one ↓, or ⌘⇧A, away) -- it costs no space here.
+  const n = subagents(store.poll).length;
+  return [a.name, state, mode, n ? `${n} subagent${n > 1 ? "s" : ""}` : "", short(a.cwd)].filter(Boolean).join(" · ");
 };
 
 // ---------------------------------------------------------------------------- full width
@@ -357,11 +359,9 @@ export function Session(props: { agent: Agent; onClose: () => void }) {
   // something the arrows move through, show only that: with nothing to scroll, the arrows only move
   // Claude's highlight. The conversation comes back as soon as it closes.
   const panel = isInteractive(p);
-  // Running subagents as a row of chips over the composer (the full list shows when ↓ selects in it).
-  const chips = panel ? "" : subagentChips(p);
   // Until a bare key has been seen, this view can't take typing yet: the one hint left says so.
   const hint = !bareKeys && !panel ? "\n\n**↵ to type** a message" : "";
-  const top = `${chips ? chips + "\n\n" : ""}${composerWithMenu(p, Boolean(store.pane), menu)}${hint}`;
+  const top = `${composerWithMenu(p, Boolean(store.pane), menu)}${hint}`;
   const markdown = panel ? top : `${top}\n\n${conversationMarkdown(store.transcript.turns, 30)}`;
   const options = p?.needs ? (menu?.items ?? []) : [];
   const openTyping = () => {

@@ -130,11 +130,15 @@ export function composerMarkdown(p: Poll | undefined, attached: boolean): string
   const rules = rows.map((r, i) => (RULE.test(r) ? i : -1)).filter((i) => i >= 0);
   if (rules.length < 2) return "```\n" + (tidy(rows).join("\n") || "❯ ▌") + "\n```";
   const input = tidy(rows.slice(rules[0] + 1, rules[1]));
-  const box = "```\n" + (input.join("\n") || "❯ ▌") + "\n```";
   // Under the box -- the status line and the subagent list -- only while you're selecting in it
-  // (after ↓): otherwise the running subagents are chips above (subagentChips) and the status line's
-  // mode is in the title.
-  if (!isInteractive(p)) return box;
+  // (after ↓); otherwise the composer is one slim pill per line (inline code), so the conversation
+  // starts right under it instead of below a tall block. The subagent count and the mode are in
+  // the title.
+  if (!isInteractive(p)) {
+    const pill = (l: string) => (l.includes("`") ? "`` " + l + " ``" : "`" + l + "`");
+    return (input.length ? input : ["❯ ▌"]).map(pill).join("  \n");
+  }
+  const box = "```\n" + (input.join("\n") || "❯ ▌") + "\n```";
   // A wide pane right-aligns the subagent timers ~150 columns out; squeeze long runs of spaces so the
   // rows don't wrap in Raycast's narrower block.
   const below = tidy(rows.slice(rules[1] + 1)).map((r) => r.replace(/ {4,}/g, "   "));
