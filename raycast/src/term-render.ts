@@ -170,6 +170,7 @@ export interface Screen {
   lines: string[]; // captured rows, with escapes
   cols: number;
   cursor?: { x: number; y: number }; // row index into `lines`
+  aspect?: number; // width / height to pad the image to, so it fits its frame exactly
 }
 
 const FONT = 14;
@@ -181,8 +182,10 @@ const PAD = 14;
 export function screenSvg(screen: Screen, header?: string): string {
   const rows = screen.lines.length;
   const width = Math.ceil(screen.cols * CW + PAD * 2);
-  const top = PAD + (header ? LH : 0);
-  const height = Math.ceil(top + rows * LH + PAD);
+  const content = PAD + (header ? LH : 0) + rows * LH + PAD;
+  // Padded out to the requested shape, with the text anchored to the bottom like a terminal's.
+  const height = Math.ceil(screen.aspect ? Math.max(content, width / screen.aspect) : content);
+  const top = PAD + (header ? LH : 0) + (height - content);
   const out: string[] = [];
   out.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`);
   out.push(`<rect width="100%" height="100%" rx="10" fill="${BG}"/>`);

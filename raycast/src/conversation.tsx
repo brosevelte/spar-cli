@@ -25,8 +25,10 @@ import { screenSvg } from "./term-render";
 import { Transcript, conversationLines } from "./term-transcript";
 
 const POLL_MS = 900;
-// The image is 4:3 at COLS columns: this many terminal rows fit (term-render's 14px font, 18px rows).
-const SCREEN_ROWS = 31;
+// The image is 16:9 at COLS columns -- the shape of the space between the search bar and the action
+// bar, so it fits without scrolling (a taller image scrolls, and every new frame jumps back to the
+// top, hiding the composer). This many terminal rows fit (term-render's 14px font, 18px rows).
+const SCREEN_ROWS = 23;
 const MAX_BOTTOM = 16;
 // Two different invisible characters, alternated so resetting the bar is always a real change.
 const Z1 = "​";
@@ -104,7 +106,7 @@ export function Conversation(props: { agent: Agent; stateLabel: string; onClose:
     const shown = all.slice(Math.max(0, end - convoRows), end);
     const lines = [...Array(Math.max(0, convoRows - shown.length)).fill(""), ...shown, ...bottom];
     const cursor = last?.cursor && !scroll ? { x: last.cursor.x, y: convoRows + last.cursor.y } : undefined;
-    const svg = screenSvg({ lines, cols: COLS, cursor });
+    const svg = screenSvg({ lines, cols: COLS, cursor, aspect: 16 / 9 });
     const file = path.join(SCREENS, `${a.id}-${createHash("sha1").update(svg).digest("hex").slice(0, 12)}.svg`);
     const previous = imageRef.current;
     if (file === previous) return;
@@ -257,7 +259,7 @@ export function Conversation(props: { agent: Agent; stateLabel: string; onClose:
   return (
     <Grid
       columns={1}
-      aspectRatio="4/3"
+      aspectRatio="16/9"
       fit={Grid.Fit.Contain}
       filtering={false}
       throttle={false}
