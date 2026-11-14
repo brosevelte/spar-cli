@@ -89,6 +89,19 @@ export function parseMenu(p: Poll | undefined): Menu | undefined {
   return { items, hi };
 }
 
+/** What's typed in Claude's composer right now ("" when it's empty, or when there's no composer box). */
+export function composerText(p: Poll | undefined): string {
+  if (!p) return "";
+  const rows = p.bottom.map(plain);
+  const rules = rows.map((r, i) => (RULE.test(r) ? i : -1)).filter((i) => i >= 0);
+  if (rules.length < 2) return "";
+  return rows
+    .slice(rules[0] + 1, rules[1])
+    .map((r) => r.replace(/^\s*❯\s?/, "").trim())
+    .join("\n")
+    .trim();
+}
+
 /** Claude's composer as text: the box and status line, rules dropped, the cursor marked. */
 export function composerMarkdown(p: Poll | undefined, attached: boolean): string {
   if (!attached) return "```\nattaching…\n```";

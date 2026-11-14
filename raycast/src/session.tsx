@@ -11,14 +11,14 @@
 // The store polls the transcript and the attached pane (term-backend.ts) and queues keystrokes, so
 // both views see the same thing and the box is polled once.
 
-import { Action, ActionPanel, Detail, Icon, List, closeMainWindow, environment, showToast, Toast, useNavigation } from "@raycast/api";
+import { Action, ActionPanel, Detail, Icon, Keyboard, List, LocalStorage, closeMainWindow, environment, showToast, Toast, useNavigation } from "@raycast/api";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { attachFromClipboard, clipboardState, compactForUpload, safeUnlink } from "./clipboard";
 import { Agent, Poll, ensureAttached, keys, newline, paste, poll, retype, upload } from "./term-backend";
-import { Menu, composerMarkdown, parseMenu } from "./term-menu";
+import { Menu, composerMarkdown, composerText, parseMenu } from "./term-menu";
 import { Transcript, conversationMarkdown } from "./term-transcript";
 import { focusGhostty, prefs, q, tmux } from "./spark";
 
@@ -220,25 +220,117 @@ const title = (a: Agent, store: SessionStore) =>
 
 // ---------------------------------------------------------------------------- full width
 
+// The keys a Raycast shortcut can name, with what they type plain and with Shift (US layout).
+const TYPEABLE: Array<[Keyboard.KeyEquivalent, string, string?]> = [
+  ...("abcdefghijklmnopqrstuvwxyz".split("").map((c) => [c, c, c.toUpperCase()]) as Array<[Keyboard.KeyEquivalent, string, string]>),
+  ...("1234567890".split("").map((c, i) => [c, c, "!@#$%^&*()"[i]]) as Array<[Keyboard.KeyEquivalent, string, string]>),
+  [".", ".", ">"],
+  [",", ",", "<"],
+  [";", ";", ":"],
+  ["'", "'", '"'],
+  ["/", "/", "?"],
+  ["-", "-", "_"],
+  ["=", "=", "+"],
+  ["[", "[", "{"],
+  ["]", "]", "}"],
+  ["\\", "\\", "|"],
+  ["`", "`", "~"],
+  ["space", " ", " "],
+];
+// Keys sent to Claude as keys, not characters: arrows move through its menus, the subagent list
+// ("↓ to manage"), a question's options and auto-mode's asks, exactly as in the TUI.
+const SPECIAL: Array<[Keyboard.KeyEquivalent, string, string]> = [
+  ["arrowUp", "Up", "↑"],
+  ["arrowDown", "Down", "↓"],
+  ["arrowLeft", "Left", "←"],
+  ["arrowRight", "Right", "→"],
+  ["tab", "Tab", "Tab"],
+];
+const BARE_KEYS = "bareKeysWork";
+
+/**
+ * Typing straight into the full-width view, by giving every key an action with a bare (modifier-
+ * less) shortcut: a Detail has no search bar, and actions are the only way it hears keys. Raycast's
+ * docs neither promise nor forbid bare-key shortcuts, so this is an experiment that degrades: until
+ * one has actually fired (remembered in LocalStorage), Enter still opens the search-bar typing view.
+ */
+function keyboardActions(store: SessionStore, onKey: () => void, back: () => void, typed: { current: string }) {
+  const type = (s: string) => {
+    trace(`bare key ${JSON.stringify(s)}`);
+    onKey();
+    typed.current += s;
+    store.enqueue({ k: "text", s });
+  };
+  const items = [];
+  for (const [key, plain, shifted] of TYPEABLE) {
+    items.push(<Action key={`k-${key}`} title={`Type ${plain === " " ? "Space" : plain}`} shortcut={{ modifiers: [], key }} onAction={() => type(plain)} />);
+    if (shifted && shifted !== plain)
+      items.push(<Action key={`K-${key}`} title={`Type ${shifted}`} shortcut={{ modifiers: ["shift"], key }} onAction={() => type(shifted)} />);
+  }
+  for (const [key, tmuxKey, label] of SPECIAL)
+    items.push(
+      <Action
+        key={`s-${key}`}
+        title={`Press ${label}`}
+        shortcut={{ modifiers: [], key }}
+        onAction={() => {
+          trace(`bare key ${tmuxKey}`);
+          onKey();
+          store.press(tmuxKey);
+        }}
+      />,
+    );
+  items.push(
+    <Action
+      key="s-backspace"
+      title="Backspace (Empty: Back to Sessions)"
+      shortcut={{ modifiers: [], key: "backspace" }}
+      onAction={() => {
+        trace("bare key BSpace");
+        onKey();
+        // With nothing typed and an empty composer, Backspace goes back to the sessions, as ← does
+        // in the TUI's attached view.
+        if (!typed.current && !composerText(store.poll)) return back();
+        typed.current = [...typed.current].slice(0, -1).join("");
+        store.enqueue({ k: "back", n: 1 });
+      }}
+    />,
+  );
+  return items;
+}
+
 export function Session(props: { agent: Agent; onClose: () => void }) {
-  const { push } = useNavigation();
+  const { push, pop } = useNavigation();
   const store = useMemo(() => new SessionStore(props.agent), []);
   useStore(store);
+  const [bareKeys, setBareKeys] = useState(false);
+  const typed = useRef("");
   useEffect(() => {
+    LocalStorage.getItem<boolean>(BARE_KEYS).then((v) => setBareKeys(Boolean(v)));
     store.start();
     return () => {
       store.stop();
       props.onClose();
     };
   }, []);
+  const sawKey = () => {
+    if (!bareKeys) {
+      setBareKeys(true);
+      LocalStorage.setItem(BARE_KEYS, true);
+    }
+  };
 
   const p = store.poll;
   const menu = parseMenu(p);
-  // This view is full width, which in Raycast means no search bar: it cannot take keystrokes. Say
-  // so where the eye lands, instead of leaving typing to look broken.
-  const hint = p?.needs ? "**↵ to answer** · ⌘1–⌘4 pick an option" : "**↵ to type** a message · ⌘K for more";
+  const hint = bareKeys
+    ? "Type to Claude · ↵ sends · ↑↓ menus, subagents and questions · ⌫ on an empty message goes back"
+    : "**↵ to type** a message · ⌘K for more";
   const markdown = `${composerWithMenu(p, Boolean(store.pane), menu)}\n\n${hint}\n\n${conversationMarkdown(store.transcript.turns, 30)}`;
   const options = p?.needs ? (menu?.items ?? []) : [];
+  const openTyping = () => {
+    trace("typing view opened");
+    push(<Typing store={store} />);
+  };
 
   return (
     <Detail
@@ -246,14 +338,19 @@ export function Session(props: { agent: Agent; onClose: () => void }) {
       markdown={markdown}
       actions={
         <ActionPanel>
-          <Action
-            title={p?.needs ? "Answer…" : "Type a Message"}
-            icon={Icon.Pencil}
-            onAction={() => {
-              trace("typing view opened");
-              push(<Typing store={store} />);
-            }}
-          />
+          {bareKeys ? (
+            <Action
+              title={p?.needs ? "Answer (Enter)" : "Send (Enter)"}
+              icon={Icon.ArrowUpCircle}
+              onAction={() => {
+                typed.current = "";
+                store.press("Enter");
+              }}
+            />
+          ) : (
+            <Action title={p?.needs ? "Answer…" : "Type a Message"} icon={Icon.Pencil} onAction={openTyping} />
+          )}
+          {bareKeys && <Action title="Type in the Search Bar" icon={Icon.Pencil} shortcut={{ modifiers: ["cmd"], key: "t" }} onAction={openTyping} />}
           {options.map((o, i) =>
             o.digit && i < 9 ? (
               <Action
@@ -270,6 +367,8 @@ export function Session(props: { agent: Agent; onClose: () => void }) {
           <Action title="Cycle Mode" icon={Icon.Switch} shortcut={{ modifiers: ["cmd", "shift"], key: "m" }} onAction={() => store.press("BTab")} />
           <Action title="Open in Ghostty" icon={Icon.Window} shortcut={{ modifiers: ["cmd", "shift"], key: "o" }} onAction={() => openInGhostty(props.agent)} />
           <Action.CopyToClipboard title="Copy Session ID" content={props.agent.sessionId} shortcut={{ modifiers: ["cmd", "shift"], key: "c" }} />
+          <Action title="Newline" icon={Icon.Text} shortcut={{ modifiers: ["shift"], key: "return" }} onAction={() => store.run((pn) => newline(pn))} />
+          <ActionPanel.Section title="Keyboard (straight into Claude)">{keyboardActions(store, sawKey, pop, typed)}</ActionPanel.Section>
         </ActionPanel>
       }
     />
