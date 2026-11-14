@@ -265,6 +265,7 @@ If it hangs at `Authenticating... Trying none...`, that's Tailscale SSH's `check
 
 | command | what it does |
 |---|---|
+| Chat with Claude | talk to Claude Code on the box from the Raycast popover — no Ghostty tab. See "Chat with Claude" below |
 | Go to Claude | focus the mosh tab, select window `claude`, pane 1 |
 | Claude Agents Page | press the agents-view key (↓, a preference) in pane 1 — Claude Code's own "↓ to manage" view |
 | Search Claude Agents | list from `claude agents --json --all` on the box, newest first, state and age as accessories. Enter opens the job in a new tmux window (`claude --resume <session>`); other actions open the agents page, copy the session id or the resume command |
@@ -276,6 +277,26 @@ If it hangs at `Authenticating... Trying none...`, that's Tailscale SSH's `check
 Setup is `spark raycast install`, then restart Ghostty once (the AppleScript flag only takes effect on launch). Latency is what makes this usable: the extension talks to the box through the `spark-ctl` alias, multiplexed over one persistent master connection (`ControlMaster auto`, 4h persist), so a command round-trips in ~40ms instead of a ~500ms handshake. The alias is separate from `Host spark` on purpose — Zed, Rune and mosh never share the socket. The remote login shell is fish, whose quoting isn't POSIX, so the extension never puts a script on ssh's command line: it pipes it to `bash -ls` on stdin.
 
 Preferences (Raycast → Extensions → Spark): ssh alias, tmux session (default `c1`), window (`claude`), Ghostty tab match (`[spark-`), repos directory (`~/src`), agents-view key (`Down`), atuin binary (`/opt/homebrew/bin/atuin`). If your `tmux_session` in the spark config isn't `c1`, set the session preference to match.
+
+### Chat with Claude
+
+A Raycast-AI-style chat with Claude Code on the box: the search bar is the composer, each exchange is a list item, the reply (with one line per tool call) is the detail pane. Bind it a hotkey in Raycast and it is a popover over whatever you're doing.
+
+| key | does |
+|---|---|
+| Enter | send (refused while a turn is running — your draft stays) |
+| `@` | while the text ends in `@<partial>`, the list becomes the chat directory's files and directories on the box (`git ls-files` plus untracked); Enter inserts the path, and a directory keeps you drilling. On send the box attaches each mentioned file's contents, a directory's listing, or an image, as the TUI does |
+| ⌘⇧V | attach the clipboard image — a screenshot, or an image file copied in Finder. A fresh image on the clipboard is also offered as an item, so after `Cmd-Shift-Ctrl-4` (or the `spark hotkeys` capture) it is one Enter. Images go to Claude as real image blocks, like a paste in the TUI, not as paths |
+| ⌘E | edit the draft multi-line (⌘↵ sends from there) |
+| ⌘. | stop the running turn |
+| ⌘N / ⌘P | new chat in a repo / switch chat |
+| ⌘O | open this chat in Ghostty (`claude --resume` in a new tmux window) |
+
+**Drafts persist.** Each chat's text and attached images are saved on every keystroke, so closing Raycast to take a screenshot or check something loses nothing.
+
+**How it runs.** Claude never runs under Raycast — Raycast unloads a command when its window closes. Each turn is a detached `claude -p --input-format stream-json` in its own process session on the box, writing the session's normal transcript, which the extension reads back. So a chat is an ordinary Claude Code session (the box's tools, MCPs, memory and CLAUDE.md), and closing the popover mid-turn doesn't stop it. The box side is `raycast/assets/spark-chat.py`; the extension uploads it to `~/.cache/spark-chat/h-<hash>.py` on first use, so there is nothing to install. Don't send from Raycast and from the TUI to the same session at once — two writers fork it.
+
+**Permissions.** Nothing can answer a permission prompt from the popover yet, so turns run in the "Chat permission mode" preference (default `acceptEdits`) and anything that would ask is denied, and Claude says so. "Chat model" and "Chat directory" are the other preferences.
 
 ## Images: pasting screenshots into a remote Claude session
 

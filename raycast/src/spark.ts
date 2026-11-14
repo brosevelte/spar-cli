@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 const run = promisify(execFile);
 
 /** execFile with stdin: the remote script travels on stdin, so no shell on either side parses it. */
-function runWithInput(cmd: string, args: string[], input: string, timeout: number): Promise<string> {
+export function runWithInput(cmd: string, args: string[], input: string, timeout: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { timeout });
     let out = "";
@@ -30,6 +30,9 @@ export interface Prefs {
   srcDir: string;
   agentsKey: string;
   atuinPath: string;
+  chatPermissionMode: string;
+  chatModel: string;
+  chatDefaultDir: string;
 }
 
 export const prefs = getPreferenceValues<Prefs>();
