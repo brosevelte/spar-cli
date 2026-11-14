@@ -62,9 +62,8 @@ export class Transcript {
       if (!this.cur) continue;
       for (const b of blocks) {
         if (b.type === "text" && b.text?.trim()) {
-          const last = this.cur.parts[this.cur.parts.length - 1];
-          if (last?.t === "text") last.text += "\n\n" + b.text;
-          else this.cur.parts.push({ t: "text", text: b.text });
+          // Each reply stays its own part: the TUI gives every one its own ●.
+          this.cur.parts.push({ t: "text", text: b.text });
         } else if (b.type === "tool_use") {
           const part: Part = { t: "tool", name: b.name ?? "tool", desc: toolDesc(b.input) };
           if (b.id) this.tools.set(b.id, part);
@@ -90,33 +89,97 @@ function toolDesc(input: Record<string, unknown> | undefined): string {
 // `$` would start a LaTeX span in Raycast's markdown renderer (red text).
 const noMath = (s: string) => s.replace(/\$/g, "\\$");
 
+// ---- tool calls, summarised the way the TUI collapses them ("Ran 2 shell commands, read 1 file")
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+function toolGroup(name: string): string {
+  if (name === "Bash" || name === "BashOutput" || name === "KillShell") return "shell";
+  if (name === "Read" || name === "NotebookRead") return "read";
+  if (name === "Edit" || name === "MultiEdit" || name === "NotebookEdit") return "edit";
+  if (name === "Write") return "write";
+  if (name === "Grep" || name === "Glob" || name === "LS") return "search";
+  if (name === "Agent" || name === "Task") return "agent";
+  if (name === "WebFetch") return "fetch";
+  if (name === "WebSearch") return "websearch";
+  if (name === "TodoWrite" || name === "TaskCreate" || name === "TaskUpdate") return "todo";
+  const mcp = /^mcp__([^_]+(?:_[^_]+)*?)__/.exec(name);
+  if (mcp) return "mcp:" + mcp[1].replace(/^claude_ai_/, "").replace(/_/g, " ");
+  return "tool:" + name;
+}
+
+/** One line for a run of tool calls, in the TUI's words; failures counted at the end. */
+export function toolSummary(tools: Part[]): string {
+  const counts = new Map<string, number>();
+  for (const t of tools) {
+    const g = toolGroup(t.name ?? "tool");
+    counts.set(g, (counts.get(g) ?? 0) + 1);
+  }
+  const phrases: string[] = [];
+  const called: string[] = [];
+  for (const [g, n] of counts) {
+    if (g === "shell") phrases.push(`ran ${plural(n, "shell command", "shell commands")}`);
+    else if (g === "read") phrases.push(`read ${plural(n, "file", "files")}`);
+    else if (g === "edit") phrases.push(`edited ${plural(n, "file", "files")}`);
+    else if (g === "write") phrases.push(`wrote ${plural(n, "file", "files")}`);
+    else if (g === "search") phrases.push(`searched ${plural(n, "time", "times")}`);
+    else if (g === "agent") phrases.push(`ran ${plural(n, "agent", "agents")}`);
+    else if (g === "fetch") phrases.push(`fetched ${plural(n, "page", "pages")}`);
+    else if (g === "websearch") phrases.push("searched the web");
+    else if (g === "todo") phrases.push("updated tasks");
+    else if (g.startsWith("mcp:")) called.push(g.slice(4));
+    else called.push(g.slice(5));
+  }
+  if (called.length) phrases.unshift(`called ${called.join(", ")}`);
+  const failed = tools.filter((t) => t.error).length;
+  const line = phrases.join(", ") + (failed ? ` (${failed} failed)` : "");
+  return line.charAt(0).toUpperCase() + line.slice(1);
+}
+
+/** Claude's text with the TUI's ● leading its first line (on a line of its own before a list, table or code). */
+function withBullet(text: string): string {
+  const t = noMath(text.trim());
+  if (/^(#{1,6}\s|[-*+]\s|\d+[.)]\s|\||```|>)/.test(t)) return `●\n\n${t}`;
+  return `● ${t}`;
+}
+
+/** Your message, bold with the ❯, like the TUI's highlighted prompt line. */
+function userLines(prompt: string, images: number): string {
+  const lines = (prompt.trim() || "(image)").split("\n").filter((l, i, all) => l.trim() || (i > 0 && i < all.length - 1));
+  const body = lines
+    .map((l, i) => {
+      const s = noMath(l.trim()).replace(/\*/g, "\\*");
+      if (!s) return "";
+      return i === 0 ? `**❯ ${s}**` : `**${s}**`;
+    })
+    .join("  \n");
+  return body + (images ? `  \n_${plural(images, "image", "images")}_` : "");
+}
+
 /**
  * The conversation as markdown, newest exchange first: a Raycast detail pane always opens at the
- * top, so the latest message is visible however long the session is. Claude's replies are markdown
- * already and render as such; tool calls collapse to one line each, as the TUI shows them.
+ * top, so the latest message is visible however long the session is. Within an exchange it reads
+ * like the TUI: your message (bold, ❯), each run of tool calls as one quiet summary line, Claude's
+ * replies (●) as the markdown they already are.
  */
 export function conversationMarkdown(turns: Turn[], max = 12): string {
   const out: string[] = [];
   for (const t of turns.slice(-max).reverse()) {
-    const prompt = noMath(t.prompt.trim() || "(image)")
-      .split("\n")
-      .map((l, i) => `> ${i === 0 ? "**❯** " : ""}${l}`)
-      .join("\n");
-    out.push(prompt + (t.images ? `\n>\n> _${t.images} image${t.images > 1 ? "s" : ""}_` : ""));
-    let tools: string[] = [];
+    if (out.length) out.push("---");
+    out.push(userLines(t.prompt, t.images));
+    let tools: Part[] = [];
     const flush = () => {
-      if (tools.length) out.push(tools.join("  \n"));
+      if (tools.length) out.push(`_${toolSummary(tools)}_`);
       tools = [];
     };
     for (const p of t.parts) {
-      if (p.t === "tool") tools.push(`\`${p.error ? "✗" : "⎿"} ${p.name}\`${p.desc ? " " + noMath(p.desc) : ""}`);
+      if (p.t === "tool") tools.push(p);
       else {
         flush();
-        out.push(noMath(p.text ?? ""));
+        out.push(withBullet(p.text ?? ""));
       }
     }
     flush();
-    out.push("---");
   }
   return out.join("\n\n");
 }

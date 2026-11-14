@@ -48,28 +48,45 @@ export function parseMenu(p: Poll | undefined): Menu | undefined {
     }
     return items.length ? { items, hi } : undefined;
   }
+  // Read upward from the composer box and stop at the first row that isn't part of a menu: the
+  // rows above a menu are the conversation, and an indented line of Claude's reply must never be
+  // taken for a menu entry (Enter would then press Down first, which in an empty-ish composer walks
+  // the prompt history and wipes the draft).
   const top = rows.findIndex((r) => RULE.test(r));
-  for (const r of rows.slice(0, top < 0 ? 0 : top)) {
-    const lead = r.length - r.trimStart().length;
-    if (!r.trim()) continue;
-    if (lead >= 10) {
-      // a wrapped description line (or a right-aligned hint, which has no entry to belong to)
-      const last = items[items.length - 1];
-      if (last) last.detail = `${last.detail ?? ""} ${r.trim()}`.trim();
+  let pendingDetail: string[] = [];
+  const found: MenuItem[] = [];
+  const marked: boolean[] = [];
+  for (let i = (top < 0 ? 0 : top) - 1; i >= 0; i--) {
+    const r = rows[i];
+    if (!r.trim()) {
+      if (found.length) break;
       continue;
     }
+    const lead = r.length - r.trimStart().length;
     let t = r.trim();
-    if (t.startsWith("❯")) {
-      hi = items.length;
-      t = t.slice(1).trim();
-    }
-    if (t.startsWith("+ ")) items.push({ kind: "file", label: t.slice(2).trim() });
-    else if (t.startsWith("/")) {
+    const isHi = t.startsWith("❯");
+    if (isHi) t = t.slice(1).trim();
+    if (lead <= 6 && t.startsWith("+ ")) {
+      found.push({ kind: "file", label: t.slice(2).trim() });
+    } else if (lead <= 6 && /^\/\S/.test(t)) {
       const m = /^(\S+)\s*(.*)$/.exec(t)!;
-      items.push({ kind: "command", label: m[1], detail: m[2] || undefined });
-    } else items.push({ kind: "other", label: t });
+      const detail = [m[2], ...pendingDetail.reverse()].filter(Boolean).join(" ");
+      found.push({ kind: "command", label: m[1], detail: detail || undefined });
+    } else if (lead >= 10 && !isHi) {
+      // a wrapped description line of the command below it... or a right-aligned hint
+      // ("✔ Update installed") when no entry follows; kept only if an entry claims it
+      pendingDetail.push(t);
+      continue;
+    } else break;
+    marked.push(isHi);
+    pendingDetail = [];
   }
-  return items.length ? { items, hi } : undefined;
+  if (!found.length) return undefined;
+  found.reverse();
+  marked.reverse();
+  items.push(...found);
+  hi = marked.indexOf(true);
+  return { items, hi };
 }
 
 /** Claude's composer as text: the box and status line, rules dropped, the cursor marked. */
@@ -82,14 +99,21 @@ export function composerMarkdown(p: Poll | undefined, attached: boolean): string
     const r = [...rows[p.cursor.y]];
     rows[p.cursor.y] = r.slice(0, p.cursor.x).join("").padEnd(p.cursor.x) + "▌" + r.slice(p.cursor.x + 1).join("");
   }
-  // The menu above the box is listed on the left; here, from the box down (all of it for a question).
-  const top = rows.findIndex((r) => RULE.test(r));
-  const from = p.needs || top < 0 ? 0 : top;
-  const shown = rows
-    .slice(from)
-    .filter((r) => !RULE.test(r))
-    .map((r) => r.replace(/\s+$/, ""));
-  while (shown.length && !shown[0].trim()) shown.shift();
-  const head = p.needs ? "**Claude is asking** — pick an option on the left, or Enter for the highlighted one\n\n" : "";
-  return head + "```\n" + (shown.join("\n") || "❯ ▌") + "\n```";
+  const tidy = (rs: string[]) => {
+    const out = rs.filter((r) => !RULE.test(r)).map((r) => r.replace(/\s+$/, ""));
+    while (out.length && !out[0].trim()) out.shift();
+    while (out.length && !out[out.length - 1].trim()) out.pop();
+    return out;
+  };
+  if (p.needs) {
+    // A question: all of it, as the TUI draws it.
+    return "**Claude is asking**\n\n```\n" + tidy(rows).join("\n") + "\n```";
+  }
+  // The input box (between its two rules) as a code block, and the status line under it as plain
+  // text -- inside the block it wrapped at the pane's width and read as noise.
+  const rules = rows.map((r, i) => (RULE.test(r) ? i : -1)).filter((i) => i >= 0);
+  if (rules.length < 2) return "```\n" + (tidy(rows).join("\n") || "❯ ▌") + "\n```";
+  const input = tidy(rows.slice(rules[0] + 1, rules[1]));
+  const status = tidy(rows.slice(rules[1] + 1))[0]?.trim();
+  return "```\n" + (input.join("\n") || "❯ ▌") + "\n```" + (status ? `\n\n${status.replace(/([*_`\\$])/g, "\\$1")}` : "");
 }
