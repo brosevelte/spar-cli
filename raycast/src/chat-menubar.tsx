@@ -1,32 +1,30 @@
-// Menu bar companion to "Chat with Claude": the one place a pending approval is visible when the
-// popover is closed (in Focus, notifications don't show). Refreshes on the manifest's interval with
-// one ssh round trip for the recent chats; a hand and a count mean Claude is waiting on you, and the
-// request can be approved or denied right from the menu.
+// Menu bar companion to Claude Terminal: the one place a waiting Claude is visible when the popover
+// is closed (in Focus, nothing else tells you). Every interval it reads the Claude panes on the box
+// (one ssh call); a question mark and a count mean a session is asking you something, and the
+// menu can answer Claude's own prompt (option 1 / option 3) or open the session.
 
 import { Color, Icon, LaunchType, MenuBarExtra, launchCommand, showHUD } from "@raycast/api";
 import { usePromise } from "@raycast/utils";
-import { Chat, Status, decide, loadChats, permissionSummary, status } from "./chat-backend";
+import { Pane, keys, listPanes } from "./term-backend";
 
-async function load(): Promise<{ chats: Chat[]; st: Status }> {
-  const chats = (await loadChats()).slice(0, 15);
-  return { chats, st: chats.length ? await status(chats.map((c) => c.id)) : {} };
-}
-
-const openChat = (c: Chat) => launchCommand({ name: "chat", type: LaunchType.UserInitiated, context: { chatId: c.id } });
+const name = (p: Pane) => (p.session.startsWith("rc-") ? p.session.slice(3) : `${p.session} · ${p.window}`);
+const ask = (p: Pane) => {
+  const line = p.tail.split("\n").find((l) => /Do you want|Would you like/.test(l)) ?? p.tail.split("\n").slice(-6)[0] ?? "";
+  const t = line.trim();
+  return t.length > 70 ? t.slice(0, 70) + "…" : t;
+};
+const openPane = (p: Pane) => launchCommand({ name: "terminal", type: LaunchType.UserInitiated, context: { paneId: p.id } });
 
 export default function Command() {
-  const { data, isLoading, revalidate } = usePromise(load);
-  const chats = data?.chats ?? [];
-  const st = data?.st ?? {};
-  const waiting = chats.filter((c) => st[c.id]?.permission);
-  const working = chats.filter((c) => st[c.id]?.running && !st[c.id]?.permission);
+  const { data, isLoading, revalidate } = usePromise(listPanes);
+  const panes = data ?? [];
+  const waiting = panes.filter((p) => p.state === "waiting");
+  const working = panes.filter((p) => p.state === "working");
 
-  const answer = async (c: Chat, behavior: "allow" | "deny") => {
-    const p = st[c.id]?.permission;
-    if (!p) return;
+  const answer = async (p: Pane, key: string, label: string) => {
     try {
-      await decide(c.id, p.id, behavior);
-      await showHUD(behavior === "allow" ? "Approved" : "Denied");
+      await keys(p.id, key);
+      await showHUD(label);
     } catch (e) {
       await showHUD(`Couldn't answer: ${e}`);
     }
@@ -41,31 +39,31 @@ export default function Command() {
           ? { source: Icon.QuestionMarkCircle, tintColor: Color.Orange }
           : working.length
             ? { source: Icon.CircleProgress, tintColor: { light: "#555555", dark: "#BBBBBB" } }
-            : { source: Icon.Message, tintColor: { light: "#888888", dark: "#888888" } }
+            : { source: Icon.Terminal, tintColor: { light: "#888888", dark: "#888888" } }
       }
       title={waiting.length ? String(waiting.length) : undefined}
-      tooltip={waiting.length ? "Claude is waiting for your approval" : working.length ? "Claude is working" : "Claude on the Spark"}
+      tooltip={waiting.length ? "Claude needs you" : working.length ? "Claude is working" : "Claude on the Spark"}
     >
       {waiting.length > 0 && (
-        <MenuBarExtra.Section title="Waiting for approval">
-          {waiting.map((c) => (
-            <MenuBarExtra.Submenu key={c.id} title={`${c.title} — ${permissionSummary(st[c.id]!.permission!)}`} icon={Icon.QuestionMarkCircle}>
-              <MenuBarExtra.Item title="Approve" icon={{ source: Icon.CheckCircle, tintColor: Color.Green }} onAction={() => answer(c, "allow")} />
-              <MenuBarExtra.Item title="Deny" icon={{ source: Icon.XMarkCircle, tintColor: Color.Red }} onAction={() => answer(c, "deny")} />
-              <MenuBarExtra.Item title="Open Chat" icon={Icon.Message} onAction={() => openChat(c)} />
+        <MenuBarExtra.Section title="Needs you">
+          {waiting.map((p) => (
+            <MenuBarExtra.Submenu key={p.id} title={`${name(p)} — ${ask(p)}`} icon={Icon.QuestionMarkCircle}>
+              <MenuBarExtra.Item title="Yes (option 1)" icon={{ source: Icon.CheckCircle, tintColor: Color.Green }} onAction={() => answer(p, "1", "Answered yes")} />
+              <MenuBarExtra.Item title="No (option 3)" icon={{ source: Icon.XMarkCircle, tintColor: Color.Red }} onAction={() => answer(p, "3", "Answered no")} />
+              <MenuBarExtra.Item title="Open" icon={Icon.Terminal} onAction={() => openPane(p)} />
             </MenuBarExtra.Submenu>
           ))}
         </MenuBarExtra.Section>
       )}
       {working.length > 0 && (
         <MenuBarExtra.Section title="Working">
-          {working.map((c) => (
-            <MenuBarExtra.Item key={c.id} title={c.title} icon={Icon.CircleProgress} onAction={() => openChat(c)} />
+          {working.map((p) => (
+            <MenuBarExtra.Item key={p.id} title={name(p)} icon={Icon.CircleProgress} onAction={() => openPane(p)} />
           ))}
         </MenuBarExtra.Section>
       )}
       <MenuBarExtra.Section>
-        <MenuBarExtra.Item title="Open Chat with Claude" icon={Icon.Message} onAction={() => launchCommand({ name: "chat", type: LaunchType.UserInitiated })} />
+        <MenuBarExtra.Item title="Open Claude Terminal" icon={Icon.Terminal} onAction={() => launchCommand({ name: "terminal", type: LaunchType.UserInitiated })} />
       </MenuBarExtra.Section>
     </MenuBarExtra>
   );
