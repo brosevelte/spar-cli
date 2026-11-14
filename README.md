@@ -290,7 +290,7 @@ A Raycast-AI-style chat with Claude Code on the box: the search bar is the compo
 | ⌘Y / ⌘⇧D / ⌘⇧R | approve / deny / deny with a reason — when Claude is waiting, the request is the top item, with the command or diff in the detail pane. Also in the composer, and in the menu bar (Approve / Deny without opening anything) |
 | ⌘⇧V | attach the clipboard image — a screenshot, or an image file copied in Finder. Images go to Claude as real image blocks, like a paste in the TUI, not as paths |
 | ⌘. | stop the running turn |
-| ⌘N / ⌘P | new chat in a repo / switch chat |
+| ⌘N / ⌘L | new chat in a repo / switch chat |
 | ⌘O | open this chat in Ghostty (`claude --resume` in a new tmux window) |
 
 **Drafts persist.** Each chat's text and attached images are saved on every keystroke, so closing Raycast to take a screenshot or check something loses nothing.

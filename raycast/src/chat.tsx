@@ -399,7 +399,7 @@ export default function Command(props: LaunchProps<{ launchContext?: { chatId?: 
         <Action
           title="Switch Chat…"
           icon={Icon.List}
-          shortcut={{ modifiers: ["cmd"], key: "p" }}
+          shortcut={{ modifiers: ["cmd"], key: "l" }}
           onAction={() => push(<SwitchChat current={chat?.id} onPick={(c) => (pop(), openChat(c))} />)}
         />
         <Action title="Open in Ghostty" icon={Icon.Terminal} shortcut={Keyboard.Shortcut.Common.Open} onAction={openInGhostty} />
