@@ -143,17 +143,18 @@ function withBullet(text: string): string {
   return `● ${t}`;
 }
 
-/** Your message, bold with the ❯, like the TUI's highlighted prompt line. */
+/**
+ * Your message as a code block: Raycast markdown has no background colours, but a code block is a
+ * full-width grey bar in monospace -- the closest thing to the TUI's highlighted ❯ line.
+ */
 function userLines(prompt: string, images: number): string {
-  const lines = (prompt.trim() || "(image)").split("\n").filter((l, i, all) => l.trim() || (i > 0 && i < all.length - 1));
-  const body = lines
-    .map((l, i) => {
-      const s = noMath(l.trim()).replace(/\*/g, "\\*");
-      if (!s) return "";
-      return i === 0 ? `**❯ ${s}**` : `**${s}**`;
-    })
-    .join("  \n");
-  return body + (images ? `  \n_${plural(images, "image", "images")}_` : "");
+  const text = (prompt.trim() || "(image)").replace(/\n{3,}/g, "\n\n");
+  const fence = text.includes("```") ? "~~~~" : "```";
+  const body = text
+    .split("\n")
+    .map((l, i) => (i === 0 ? "❯ " : "  ") + l)
+    .join("\n");
+  return `${fence}\n${body}\n${fence}` + (images ? `\n\n_${plural(images, "image", "images")}_` : "");
 }
 
 /**

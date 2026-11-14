@@ -11,8 +11,8 @@
 // The store polls the transcript and the attached pane (term-backend.ts) and queues keystrokes, so
 // both views see the same thing and the box is polled once.
 
-import { Action, ActionPanel, Detail, Icon, List, closeMainWindow, showToast, Toast, useNavigation } from "@raycast/api";
-import { readFileSync } from "node:fs";
+import { Action, ActionPanel, Detail, Icon, List, closeMainWindow, environment, showToast, Toast, useNavigation } from "@raycast/api";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
@@ -31,9 +31,21 @@ const short = (p: string) => p.replace(/^\/home\/[^/]+/, "~");
 
 type Op = { k: "text"; s: string } | { k: "back"; n: number } | { k: "run"; fn: (pane: string) => Promise<void> };
 
+// What the typing path did, one line per event, in the extension's support directory: when a
+// keystroke doesn't reach Claude, this says whether Raycast delivered it, and what sending it did.
+const TYPING_LOG = path.join(environment.supportPath, "typing.log");
+function trace(msg: string) {
+  try {
+    mkdirSync(environment.supportPath, { recursive: true });
+    appendFileSync(TYPING_LOG, `${new Date().toISOString()} ${msg}\n`);
+  } catch {
+    // tracing must never break typing
+  }
+}
+
 // ---------------------------------------------------------------------------- the shared connection
 
-class SessionStore {
+export class SessionStore {
   transcript = new Transcript();
   poll?: Poll;
   pane?: string;
@@ -47,13 +59,19 @@ class SessionStore {
   constructor(readonly agent: Agent) {}
 
   start() {
+    trace(`open ${this.agent.id} (${this.agent.name})`);
     ensureAttached(this.agent.id)
       .then((p) => {
+        trace(`attached ${this.agent.id} -> ${p}`);
         this.pane = p;
         this.changed();
         this.tick();
+        this.pump(); // anything typed while attaching was queued, waiting for the pane
       })
-      .catch((e) => showToast({ style: Toast.Style.Failure, title: "Couldn't attach", message: String(e) }));
+      .catch((e) => {
+        trace(`attach failed ${this.agent.id}: ${e}`);
+        showToast({ style: Toast.Style.Failure, title: "Couldn't attach", message: String(e) });
+      });
     this.tick();
     this.timer = setInterval(() => this.tick(), POLL_MS);
   }
@@ -97,6 +115,7 @@ class SessionStore {
     if (prev && op.k === "text" && prev.k === "text") prev.s += op.s;
     else if (prev && op.k === "back" && prev.k === "back") prev.n += op.n;
     else this.ops.push(op);
+    trace(`queue ${op.k === "text" ? JSON.stringify(op.s) : op.k === "back" ? `back ${op.n}` : "key"} (pane ${this.pane ?? "not attached yet"})`);
     this.pump();
   }
 
@@ -110,7 +129,9 @@ class SessionStore {
           if (op.k === "text") await retype(this.pane, 0, op.s);
           else if (op.k === "back") await retype(this.pane, op.n, "");
           else await op.fn(this.pane);
+          trace(`sent ${op.k === "text" ? JSON.stringify(op.s) : op.k} to ${this.pane}`);
         } catch (e) {
+          trace(`send failed: ${e}`);
           showToast({ style: Toast.Style.Failure, title: "Couldn't reach Claude", message: String(e) });
         }
         this.tick();
@@ -213,7 +234,10 @@ export function Session(props: { agent: Agent; onClose: () => void }) {
 
   const p = store.poll;
   const menu = parseMenu(p);
-  const markdown = `${composerWithMenu(p, Boolean(store.pane), menu)}\n\n${conversationMarkdown(store.transcript.turns, 30)}`;
+  // This view is full width, which in Raycast means no search bar: it cannot take keystrokes. Say
+  // so where the eye lands, instead of leaving typing to look broken.
+  const hint = p?.needs ? "**↵ to answer** · ⌘1–⌘4 pick an option" : "**↵ to type** a message · ⌘K for more";
+  const markdown = `${composerWithMenu(p, Boolean(store.pane), menu)}\n\n${hint}\n\n${conversationMarkdown(store.transcript.turns, 30)}`;
   const options = p?.needs ? (menu?.items ?? []) : [];
 
   return (
@@ -222,7 +246,14 @@ export function Session(props: { agent: Agent; onClose: () => void }) {
       markdown={markdown}
       actions={
         <ActionPanel>
-          <Action title={p?.needs ? "Answer…" : "Reply"} icon={Icon.Pencil} onAction={() => push(<Typing store={store} />)} />
+          <Action
+            title={p?.needs ? "Answer…" : "Type a Message"}
+            icon={Icon.Pencil}
+            onAction={() => {
+              trace("typing view opened");
+              push(<Typing store={store} />);
+            }}
+          />
           {options.map((o, i) =>
             o.digit && i < 9 ? (
               <Action
@@ -258,6 +289,7 @@ function Typing(props: { store: SessionStore }) {
   const resetBar = () => setBar((b) => (b === KEYBOARD[0] ? KEYBOARD[1] : KEYBOARD[0]));
 
   function onSearch(t: string) {
+    trace(`search bar ${JSON.stringify(t)} (was ${JSON.stringify(bar)})`);
     const added = t.replace(INVISIBLE, "");
     const marks = (t.match(INVISIBLE) ?? []).length;
     if (added) {
