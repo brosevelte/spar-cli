@@ -284,7 +284,7 @@ Claude Code on the box in a Raycast popover, shaped like the TUI's agents view. 
 
 - **Sessions (full width).** Every session on the box, grouped needs you / working / done, with age. Type a task and press Enter to dispatch a new background session (`claude --bg`, in the directory from the dropdown), as in the agents view. Enter on a session opens it.
 - **A conversation (full width).** The session's transcript drawn terminal-style (`❯` your messages, `●` Claude's, `⎿` one line per tool call), wrapped to the popover and pinned to the newest message. Under it are the live bottom rows of the TUI: its composer, `@` / slash menus, and any question Claude is asking. It is one SVG frame (`src/term-transcript.ts` → `src/term-render.ts`), refreshed about every second, shown in a one-column Grid so it spans the window and keeps a search bar.
-- **Typing.** The search bar is mirrored into the session's composer as you type. Raycast keeps its own tmux session on the box (`spark-raycast`, one window per conversation you've opened, each `claude attach <id>`). Attaching is shared: Ghostty's agents view can show the same session at the same time, and both see one composer, so a half-written message is visible in both and survives closing Raycast. Enter sends, or answers the highlighted option when Claude is asking.
+- **Typing.** In a conversation the search bar is only a keyboard: it holds one invisible character, each keystroke goes straight into the session's composer and the bar resets, so what you type appears in the image, in Claude's own composer (Backspace arrives as the invisible character being deleted). Raycast keeps its own tmux session on the box (`spark-raycast`, one window per conversation you've opened, each `claude attach <id>`). Attaching is shared: Ghostty's agents view can show the same session at the same time and both see one composer, so a half-written message is visible in both and survives closing Raycast. Enter sends, or answers the highlighted option when Claude is asking. The image only changes when what it shows does (a message, a keystroke, a question), because Raycast reloads it on every new frame.
 
 | key | does |
 |---|---|
@@ -302,7 +302,7 @@ On the session list: ⌃X stops a running session, ⌘⇧C copies its session id
 
 **Claude Status** is the menu bar half: a question mark and a count when a session needs you, with Yes / No (answered through the attached pane) and Open right in the menu. In Focus it's the only thing that tells you Claude is waiting, so turn it on.
 
-The mirror only knows what it typed. If you also type into the same composer from Ghostty, ⌘⇧⌫ resets both.
+The `@` picker works from what you typed in Raycast since the last send; ⌘⇧⌫ clears the composer if the two get out of step.
 
 ## Images: pasting screenshots into a remote Claude session
 
