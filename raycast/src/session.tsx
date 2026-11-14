@@ -234,7 +234,8 @@ function composerWithMenu(p: Poll | undefined, attached: boolean, menu: Menu | u
   const box = composerMarkdown(p, attached);
   if (!menu || p?.needs) return box;
   const lines = menu.items.map((it, i) => `${i === menu.hi ? "❯" : " "} ${it.kind === "file" ? "+ " : ""}${it.label}${it.detail ? "  — " + it.detail : ""}`);
-  return "```\n" + lines.join("\n") + "\n```\n\n" + box;
+  // Input first, the completions under it -- the order of a search field and its results.
+  return box + "\n\n```\n" + lines.join("\n") + "\n```";
 }
 
 const title = (a: Agent, store: SessionStore) => {

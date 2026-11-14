@@ -134,11 +134,10 @@ export function composerMarkdown(p: Poll | undefined, attached: boolean): string
   // (after ↓); otherwise the composer is one slim pill per line (inline code), so the conversation
   // starts right under it instead of below a tall block. The subagent count and the mode are in
   // the title.
-  if (!isInteractive(p)) {
-    const pill = (l: string) => (l.includes("`") ? "`` " + l + " ``" : "`" + l + "`");
-    return (input.length ? input : ["❯ ▌"]).map(pill).join("  \n");
-  }
+  // A full-width bar: a code block is the only full-width element markdown has (an inline-code pill
+  // shrinks to its text), and it's one line tall while the message is.
   const box = "```\n" + (input.join("\n") || "❯ ▌") + "\n```";
+  if (!isInteractive(p)) return box;
   // A wide pane right-aligns the subagent timers ~150 columns out; squeeze long runs of spaces so the
   // rows don't wrap in Raycast's narrower block.
   const below = tidy(rows.slice(rules[1] + 1)).map((r) => r.replace(/ {4,}/g, "   "));
