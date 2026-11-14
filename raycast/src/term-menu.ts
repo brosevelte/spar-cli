@@ -130,12 +130,66 @@ export function composerMarkdown(p: Poll | undefined, attached: boolean): string
   const rules = rows.map((r, i) => (RULE.test(r) ? i : -1)).filter((i) => i >= 0);
   if (rules.length < 2) return "```\n" + (tidy(rows).join("\n") || "❯ ▌") + "\n```";
   const input = tidy(rows.slice(rules[0] + 1, rules[1]));
-  // Under the box: the status line and the subagent list (which ↓ moves through), monospace so its
-  // columns line up as in the TUI.
+  const box = "```\n" + (input.join("\n") || "❯ ▌") + "\n```";
+  // Under the box -- the status line and the subagent list -- only while you're selecting in it
+  // (after ↓): otherwise the running subagents are chips above (subagentChips) and the status line's
+  // mode is in the title.
+  if (!isInteractive(p)) return box;
   // A wide pane right-aligns the subagent timers ~150 columns out; squeeze long runs of spaces so the
   // rows don't wrap in Raycast's narrower block.
   const below = tidy(rows.slice(rules[1] + 1)).map((r) => r.replace(/ {4,}/g, "   "));
-  return "```\n" + (input.join("\n") || "❯ ▌") + "\n```" + (below.length ? "\n\n```\n" + below.join("\n") + "\n```" : "");
+  return box + (below.length ? "\n\n```\n" + below.join("\n") + "\n```" : "");
+}
+
+/** The rows under the composer box (status line, subagent list), plain. */
+function belowBox(p: Poll | undefined): string[] {
+  if (!p) return [];
+  const rows = p.bottom.map(plain);
+  const rules = rows.map((r, i) => (RULE.test(r) ? i : -1)).filter((i) => i >= 0);
+  return rules.length >= 2 ? rows.slice(rules[1] + 1) : [];
+}
+
+/** The permission mode from the status line ("auto", "plan", "accept edits", ...), if it shows one. */
+export function modeName(p: Poll | undefined): string | undefined {
+  const status = belowBox(p).find((r) => r.trim());
+  const m = status && /(?:^|[·⏵⏸\s])((?:[a-z]+ )?(?:mode|edits)) on\b/i.exec(status);
+  if (!m) return undefined;
+  return m[1].replace(/ mode$/i, "").trim().toLowerCase();
+}
+
+export interface Subagent {
+  kind: string; // general-purpose, an agent type, or a named workflow
+  title: string; // what it's doing
+  time: string; // runtime, two units ("13h 20m")
+  tokens: string; // "517.6k"
+}
+
+/**
+ * The running subagents from the list under the composer ("◯ general-purpose  Handing back the
+ * report   13h 20m 19s · ↓ 517.6k tokens"); the main session's own row is skipped.
+ */
+export function subagents(p: Poll | undefined): Subagent[] {
+  const out: Subagent[] = [];
+  for (const raw of belowBox(p)) {
+    const m = /^\s*(?:❯\s*)?[◯○●◉◐◑]\s+(\S+)\s*(.*)$/.exec(raw);
+    if (!m || m[1] === "main") continue;
+    const stats = /([0-9][0-9hms. ]*?)\s*·\s*↓\s*([0-9.]+[kmKM]?)\s*tokens\s*$/.exec(m[2]);
+    const before = stats ? m[2].slice(0, stats.index) : m[2];
+    // The middle is the task title -- or a progress bar for a workflow, which says less than its name.
+    const title = before.replace(/[▰▱]+\s*\S*\s*·?\s*$/, "").replace(/\s{2,}/g, " ").trim();
+    const time = (stats?.[1] ?? "").trim().split(/\s+/).slice(0, 2).join(" ");
+    out.push({ kind: m[1], title: title || m[1], time, tokens: stats?.[2] ?? "" });
+  }
+  return out;
+}
+
+/** The running subagents as one row of chips: inline code renders as a small grey pill. */
+export function subagentChips(p: Poll | undefined): string {
+  const chip = (s: Subagent) => {
+    const t = s.title.length > 34 ? s.title.slice(0, 33) + "…" : s.title;
+    return "`◯ " + [t, s.time, s.tokens].filter(Boolean).join(" · ").replace(/`/g, "'") + "`";
+  };
+  return subagents(p).map(chip).join(" ");
 }
 
 /**

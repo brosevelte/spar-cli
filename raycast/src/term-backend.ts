@@ -126,6 +126,11 @@ size=$(tmux display -p -t ${layout} '#{pane_width} #{pane_height}' 2>/dev/null |
 w=\${size% *}; h=\${size#* }
 tmux has-session -t =${RC} 2>/dev/null || tmux new-session -d -s ${RC} -x "$w" -y "$h" -n home
 p=$(tmux list-panes -s -t =${RC} -F '#{window_name} #{pane_id} #{pane_dead}' | awk '$1=="${win}" && $3=="0" {print $2; exit}')
+# Still attached? ← on an empty composer takes \`claude attach\` back to the agents view, where
+# typing would dispatch new sessions: a window in that state is replaced, not reused.
+if [ -n "$p" ] && ! pgrep -f "claude attach ${win.slice(2)}" -P "$(tmux display -p -t "$p" '#{pane_pid}')" >/dev/null; then
+  tmux kill-pane -t "$p"; p=""
+fi
 if [ -z "$p" ]; then
   while tmux kill-window -t =${RC}:${win} 2>/dev/null; do :; done
   p=$(tmux new-window -d -t =${RC}: -n ${win} -P -F '#{pane_id}' "${CLAUDE.replace(/"/g, "")} attach ${win.slice(2)}")
@@ -144,6 +149,7 @@ export interface Poll {
   bottom: string[]; // the attached pane's bottom rows, with escapes
   cursor?: { x: number; y: number }; // within `bottom`
   needs: boolean; // the pane is asking something (permission prompt, choice)
+  detached: boolean; // the pane is no longer running `claude attach` (e.g. ← took it to the agents view)
 }
 
 const NEEDS = /Do you want to|Would you like to|❯ 1\. |Esc to cancel|Enter to select/;
@@ -186,6 +192,7 @@ f=$(ls -t ~/.claude/projects/*/${q(sessionId)}.jsonl 2>/dev/null | head -1)
 size=0; [ -n "$f" ] && size=$(stat -c %s "$f")
 echo "$size"
 ${pane ? `tmux display -p -t ${t} '#{cursor_x} #{cursor_y}' 2>/dev/null || echo "0 0"` : `echo "0 0"`}
+${pane ? `pgrep -f "claude attach" -P "$(tmux display -p -t ${t} '#{pane_pid}' 2>/dev/null)" >/dev/null && echo attached || echo detached` : `echo attached`}
 printf '${SEP}\\n'
 ${pane ? `tmux capture-pane -p -e -t ${t} 2>/dev/null` : ""}
 printf '${SEP}\\n'
@@ -195,7 +202,7 @@ fi`,
     20000,
   );
   const [head, screen = "", chunk = ""] = out.split(SEP + "\n");
-  const [sizeLine, geo = "0 0"] = head.split("\n");
+  const [sizeLine, geo = "0 0", attachState = "attached"] = head.split("\n");
   const [cx, cy] = geo.split(" ").map(Number);
   const lines = screen.split("\n");
   if (lines[lines.length - 1] === "") lines.pop();
@@ -225,6 +232,7 @@ fi`,
     bottom: tail.slice(start, end),
     cursor: pane && cy >= start ? { x: cx, y: cy - start } : undefined,
     needs,
+    detached: attachState.trim() === "detached",
   };
 }
 

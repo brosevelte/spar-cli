@@ -18,7 +18,7 @@ import path from "node:path";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { attachFromClipboard, clipboardState, compactForUpload, safeUnlink } from "./clipboard";
 import { Agent, Poll, ensureAttached, keys, newline, paste, poll, retype, upload } from "./term-backend";
-import { Menu, composerMarkdown, composerText, isInteractive, parseMenu } from "./term-menu";
+import { Menu, composerMarkdown, composerText, isInteractive, modeName, parseMenu, subagentChips } from "./term-menu";
 import { Transcript, conversationMarkdown } from "./term-transcript";
 import { focusGhostty, prefs, q, tmux } from "./spark";
 
@@ -90,9 +90,31 @@ export class SessionStore {
     this.listeners.forEach((f) => f());
   }
 
+  private reattaching = false;
+
+  /** The pane stopped running `claude attach` (← took it to the agents view): replace it before typing goes there. */
+  private reattach() {
+    if (this.reattaching) return;
+    this.reattaching = true;
+    trace(`pane ${this.pane} detached from ${this.agent.id}; reattaching`);
+    this.pane = undefined; // nothing more is sent to it: typing there would dispatch new sessions
+    ensureAttached(this.agent.id)
+      .then((p) => {
+        trace(`reattached ${this.agent.id} -> ${p}`);
+        this.pane = p;
+        this.pump();
+      })
+      .catch((e) => trace(`reattach failed: ${e}`))
+      .finally(() => {
+        this.reattaching = false;
+        this.changed();
+      });
+  }
+
   async tick() {
     try {
       const p = await poll(this.agent.sessionId, this.offset, this.pane, 16);
+      if (p.detached && this.pane) return this.reattach();
       let changed = false;
       if (p.chunk) {
         this.transcript.feed(p.chunk);
@@ -215,8 +237,11 @@ function composerWithMenu(p: Poll | undefined, attached: boolean, menu: Menu | u
   return "```\n" + lines.join("\n") + "\n```\n\n" + box;
 }
 
-const title = (a: Agent, store: SessionStore) =>
-  `${a.name} · ${store.poll?.needs ? "needs you" : a.state === "needs" ? "needs you" : a.state === "working" ? "working" : "done"} · ${short(a.cwd)}`;
+const title = (a: Agent, store: SessionStore) => {
+  const state = store.poll?.needs || a.state === "needs" ? "needs you" : a.state === "working" ? "working" : "done";
+  const mode = modeName(store.poll);
+  return [a.name, state, mode, short(a.cwd)].filter(Boolean).join(" · ");
+};
 
 // ---------------------------------------------------------------------------- full width
 
@@ -276,6 +301,9 @@ function keyboardActions(store: SessionStore, onKey: () => void, back: () => voi
         onAction={() => {
           trace(`bare key ${tmuxKey}`);
           onKey();
+          // ← on an empty composer is the TUI's "back to the agents view": here that means back to
+          // the sessions list -- sent to Claude it would detach Raycast's pane from the session.
+          if (tmuxKey === "Left" && !typed.current && !composerText(store.poll) && !isInteractive(store.poll)) return back();
           store.press(tmuxKey);
         }}
       />,
@@ -329,14 +357,12 @@ export function Session(props: { agent: Agent; onClose: () => void }) {
   // something the arrows move through, show only that: with nothing to scroll, the arrows only move
   // Claude's highlight. The conversation comes back as soon as it closes.
   const panel = isInteractive(p);
-  const hint = panel
-    ? "↑↓ move · ↵ choose · ⌫ closes it (Escape)"
-    : bareKeys
-      ? "Type to Claude · ↵ sends · ↑↓ menus, subagents and questions · ⌫ on an empty message goes back"
-      : "**↵ to type** a message · ⌘K for more";
-  const markdown = panel
-    ? `${composerWithMenu(p, Boolean(store.pane), menu)}\n\n${hint}`
-    : `${composerWithMenu(p, Boolean(store.pane), menu)}\n\n${hint}\n\n${conversationMarkdown(store.transcript.turns, 30)}`;
+  // Running subagents as a row of chips over the composer (the full list shows when ↓ selects in it).
+  const chips = panel ? "" : subagentChips(p);
+  // Until a bare key has been seen, this view can't take typing yet: the one hint left says so.
+  const hint = !bareKeys && !panel ? "\n\n**↵ to type** a message" : "";
+  const top = `${chips ? chips + "\n\n" : ""}${composerWithMenu(p, Boolean(store.pane), menu)}${hint}`;
+  const markdown = panel ? top : `${top}\n\n${conversationMarkdown(store.transcript.turns, 30)}`;
   const options = p?.needs ? (menu?.items ?? []) : [];
   const openTyping = () => {
     trace("typing view opened");
@@ -375,7 +401,9 @@ export function Session(props: { agent: Agent; onClose: () => void }) {
           )}
           <Action title="Paste Screenshot" icon={Icon.Image} shortcut={{ modifiers: ["ctrl"], key: "v" }} onAction={() => pasteImage(store)} />
           <Action title="Escape / Interrupt" icon={Icon.Stop} shortcut={{ modifiers: ["cmd"], key: "." }} onAction={() => store.press("Escape")} />
-          <Action title="Cycle Mode" icon={Icon.Switch} shortcut={{ modifiers: ["cmd", "shift"], key: "m" }} onAction={() => store.press("BTab")} />
+          <Action title={`Cycle Mode${modeName(p) ? ` (now ${modeName(p)})` : ""}`} icon={Icon.Switch} shortcut={{ modifiers: ["cmd", "shift"], key: "m" }} onAction={() => store.press("BTab")} />
+          <Action title="Show Tasks & Shells" icon={Icon.List} shortcut={{ modifiers: ["cmd", "shift"], key: "t" }} onAction={() => store.press("C-t")} />
+          <Action title="Manage Subagents" icon={Icon.TwoPeople} shortcut={{ modifiers: ["cmd", "shift"], key: "a" }} onAction={() => store.press("Down")} />
           <Action title="Open in Ghostty" icon={Icon.Window} shortcut={{ modifiers: ["cmd", "shift"], key: "o" }} onAction={() => openInGhostty(props.agent)} />
           <Action.CopyToClipboard title="Copy Session ID" content={props.agent.sessionId} shortcut={{ modifiers: ["cmd", "shift"], key: "c" }} />
           <Action title="Newline" icon={Icon.Text} shortcut={{ modifiers: ["shift"], key: "return" }} onAction={() => store.run((pn) => newline(pn))} />
