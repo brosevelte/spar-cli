@@ -1,7 +1,6 @@
 // A Claude Code session transcript (~/.claude/projects/<dir>/<session>.jsonl) as conversation turns,
-// and those turns as terminal lines (ANSI-styled, wrapped) for term-render.ts. This is the real
-// conversation -- what you said, what Claude said, which tools it ran -- rather than whatever the
-// TUI happens to have on screen, so it can be drawn at the popover's width and pinned to the end.
+// and those turns as markdown for a Raycast detail pane. This is the real conversation -- what you
+// said, what Claude said, which tools it ran -- as text, rather than whatever the TUI has on screen.
 
 export interface Part {
   t: "text" | "tool";
@@ -86,85 +85,38 @@ function toolDesc(input: Record<string, unknown> | undefined): string {
   return "";
 }
 
-// ---------------------------------------------------------------------------- as terminal lines
+// ---------------------------------------------------------------------------- as markdown
 
-const E = "\x1b[";
-const RESET = `${E}0m`;
-const USER = `${E}38;2;126;231;135m`; // prompt green, like the TUI's ❯
-const DIM = `${E}2m`;
-const RED = `${E}38;2;255;123;114m`;
-const CODE = `${E}38;2;121;192;255m`;
-const BOLD = `${E}1m`;
-const UNBOLD = `${E}22m`;
+// `$` would start a LaTeX span in Raycast's markdown renderer (red text).
+const noMath = (s: string) => s.replace(/\$/g, "\\$");
 
-/** Inline markdown the TUI also styles: **bold**, `code`, # headings. Applied after wrapping. */
-function inline(s: string, base: string): string {
-  return s
-    .replace(/\u0000([^\u0001]*)\u0001/g, `${CODE}$1${RESET}${base}`)
-    .replace(/\*\*([^*]+)\*\*/g, `${BOLD}$1${UNBOLD}`)
-    .replace(/`([^`]+)`/g, `${CODE}$1${RESET}${base}`)
-    .replace(/^(#{1,6}) (.*)$/, `${BOLD}$2${UNBOLD}`);
-}
-
-/** Word-wrap one paragraph line to `width` columns (hard-splitting words longer than a line). */
-function wrap(line: string, width: number): string[] {
-  if (line.length <= width) return [line];
+/**
+ * The conversation as markdown, newest exchange first: a Raycast detail pane always opens at the
+ * top, so the latest message is visible however long the session is. Claude's replies are markdown
+ * already and render as such; tool calls collapse to one line each, as the TUI shows them.
+ */
+export function conversationMarkdown(turns: Turn[], max = 12): string {
   const out: string[] = [];
-  let cur = "";
-  for (const word of line.split(/(\s+)/)) {
-    if ((cur + word).length <= width) {
-      cur += word;
-      continue;
-    }
-    if (cur.trim()) out.push(cur.replace(/\s+$/, ""));
-    cur = word.trimStart();
-    while (cur.length > width) {
-      out.push(cur.slice(0, width));
-      cur = cur.slice(width);
-    }
-  }
-  if (cur.trim()) out.push(cur);
-  return out;
-}
-
-/** Text under a gutter: the first line gets `first`, the rest are indented to match. */
-function block(text: string, cols: number, first: string, firstColor: string, color: string): string[] {
-  const out: string[] = [];
-  const width = cols - 2;
-  let fence = false;
-  let lead = true;
-  // Links show as their text, as in the TUI: wrap what will be displayed, not the URL.
-  const shown = text.replace(/\[([^\]]+)\]\((?:https?|file):[^)\s]+\)/g, "\u0000$1\u0001");
-  for (const raw of shown.split("\n")) {
-    if (/^\s*```/.test(raw)) fence = !fence;
-    const pieces = fence || /^\s*```/.test(raw) ? [raw.slice(0, width)] : wrap(raw, width);
-    for (const p of pieces) {
-      const gutter = lead ? `${firstColor}${first}${RESET}` : "  ";
-      lead = false;
-      const body = fence || /^\s*```/.test(raw) ? `${CODE}${p}${RESET}` : `${color}${inline(p, color)}${RESET}`;
-      out.push(gutter + body);
-    }
-  }
-  return out;
-}
-
-/** The whole conversation as styled lines, oldest first. */
-export function conversationLines(turns: Turn[], cols: number): string[] {
-  const lines: string[] = [];
-  for (const t of turns) {
-    lines.push("");
-    lines.push(...block(t.prompt || "(image)", cols, "❯ ", USER, USER));
-    if (t.images) lines.push(`  ${DIM}[${t.images} image${t.images > 1 ? "s" : ""}]${RESET}`);
+  for (const t of turns.slice(-max).reverse()) {
+    const prompt = noMath(t.prompt.trim() || "(image)")
+      .split("\n")
+      .map((l, i) => `> ${i === 0 ? "**❯** " : ""}${l}`)
+      .join("\n");
+    out.push(prompt + (t.images ? `\n>\n> _${t.images} image${t.images > 1 ? "s" : ""}_` : ""));
+    let tools: string[] = [];
+    const flush = () => {
+      if (tools.length) out.push(tools.join("  \n"));
+      tools = [];
+    };
     for (const p of t.parts) {
-      if (p.t === "tool") {
-        const d = p.desc ? ` — ${p.desc}` : "";
-        const line = `⎿ ${p.error ? "✗" : "⚙"} ${p.name}${d}`;
-        lines.push(`  ${p.error ? RED : DIM}${line.slice(0, cols - 3)}${RESET}`);
-      } else {
-        lines.push("");
-        lines.push(...block(p.text ?? "", cols, "● ", "", ""));
+      if (p.t === "tool") tools.push(`\`${p.error ? "✗" : "⎿"} ${p.name}\`${p.desc ? " " + noMath(p.desc) : ""}`);
+      else {
+        flush();
+        out.push(noMath(p.text ?? ""));
       }
     }
+    flush();
+    out.push("---");
   }
-  return lines;
+  return out.join("\n\n");
 }

@@ -265,7 +265,7 @@ If it hangs at `Authenticating... Trying none...`, that's Tailscale SSH's `check
 
 | command | what it does |
 |---|---|
-| Claude Terminal | Claude Code in the Raycast popover, like the agents view: sessions with real state, a full-width conversation, type into its composer. See "Claude Terminal" below |
+| Claude Terminal | Claude Code in the Raycast popover as text: sessions with real state, the conversation, typing straight into its composer. See "Claude Terminal" below |
 | Go to Claude | focus the mosh tab, select window `claude`, pane 1 |
 | Claude Agents Page | press the agents-view key (↓, a preference) in pane 1 — Claude Code's own "↓ to manage" view |
 | Search Claude Agents | list from `claude agents --json --all` on the box, newest first, state and age as accessories. Enter opens the job in a new tmux window (`claude --resume <session>`); other actions open the agents page, copy the session id or the resume command |
@@ -280,29 +280,26 @@ Preferences (Raycast → Extensions → Spark): ssh alias, tmux session (default
 
 ### Claude Terminal
 
-Claude Code on the box in a Raycast popover, shaped like the TUI's agents view. Built from real values, not screen-scraping: `claude agents --json` for the sessions and their state, each session's transcript JSONL for the conversation, and a tmux pane running `claude attach <id>` for typing.
+Claude Code on the box in a Raycast popover, as text. Everything shown is a real value: sessions and their state from `claude agents --json`, the conversation from the session's transcript JSONL, and Claude's live composer from a tmux pane running `claude attach <id>`.
 
-- **Sessions (full width).** Every session on the box, grouped needs you / working / done, with age. Type a task and press Enter to dispatch a new background session (`claude --bg`, in the directory from the dropdown), as in the agents view. Enter on a session opens it.
-- **A conversation (full width).** The session's transcript drawn terminal-style (`❯` your messages, `●` Claude's, `⎿` one line per tool call), wrapped to the popover and pinned to the newest message. Under it are the live bottom rows of the TUI: its composer, `@` / slash menus, and any question Claude is asking. It is one SVG frame (`src/term-transcript.ts` → `src/term-render.ts`), refreshed about every second, shown in a one-column Grid so it spans the window and keeps a search bar.
-- **Typing.** In a conversation the search bar is only a keyboard: it holds one invisible character, each keystroke goes straight into the session's composer and the bar resets, so what you type appears in the image, in Claude's own composer (Backspace arrives as the invisible character being deleted). Raycast keeps its own tmux session on the box (`spark-raycast`, one window per conversation you've opened, each `claude attach <id>`). Attaching is shared: Ghostty's agents view can show the same session at the same time and both see one composer, so a half-written message is visible in both and survives closing Raycast. Enter sends, or answers the highlighted option when Claude is asking. The image only changes when what it shows does (a message, a keystroke, a question), because Raycast reloads it on every new frame.
+- **Left:** "New session", then every session grouped needs you / working / done. ↑↓ moves between them.
+- **Right:** the selected session. Claude's composer is at the top (the input line with a `▌` cursor, and when it shows one, Claude's own `@` menu, slash menu or question). Under it is the conversation as markdown, newest exchange first: your messages quoted with `❯`, Claude's replies as the markdown they already are, and one line per tool call. Newest first because a Raycast detail pane always opens at the top.
+- **The search bar:** on "New session" it's the task. Enter starts `claude --bg` in the dropdown's directory, as the agents view does. On a session it's a keyboard: it holds two invisible characters, every keystroke goes straight into the session's composer and the bar resets, so what you type appears in the composer on the right. Raycast keeps its own tmux session on the box (`spark-raycast`, one window per session you've opened). Attaching is shared, so Ghostty's agents view sees the same composer and a draft survives closing Raycast.
 
 | key | does |
 |---|---|
-| typing / Enter | into Claude's composer / Enter in Claude |
-| `@` | while the bar ends in `@<partial>`, a picker of the repo's files; Enter completes the path (a directory keeps completing inside it) |
-| ⌘↵ | newline in the composer (backslash-Enter), for long messages |
-| ⌘⇧V | upload the clipboard image to `~/clipboard` on the box and paste its path, which Claude attaches as `[Image #n]` |
+| typing / Backspace / Enter | straight into Claude: Enter sends, answers a question, or accepts an `@` / slash suggestion, as the TUI decides |
+| Escape | first press clears the keyboard (nothing is sent); the second closes Raycast |
+| ⌘↵ | newline in the composer (backslash-Enter) |
+| ⌃V | paste the clipboard screenshot into the composer: reuses the upload `spark hotkeys` already made when it's the same image, otherwise uploads it to `~/clipboard`. Claude attaches it as `[Image #n]` |
 | ⌘1 / ⌘2 / ⌘3 | pick an option when Claude asks (1 = yes, 3 = no) |
-| ⌘⇧↑ / ⌘⇧↓ / ⌘⇧T / ⌘. / ⌘⇧M | Up / Down / Tab / Escape (interrupt) / Shift-Tab (cycle mode) in Claude |
-| ⌥⌫ / ⌘⇧⌫ | Backspace in Claude / clear Claude's input |
-| ⌥↑ / ⌥↓ | scroll the conversation |
+| ⌘⇧↑ / ⌘⇧↓ / ⌘⇧T | Up / Down / Tab in Claude (move through its menus, accept a suggestion) |
+| ⌘. / ⌘⇧M / ⌘⇧⌫ | Escape (interrupt) / Shift-Tab (cycle mode) / clear the composer |
+| ⌘⇧F | read the conversation full width |
 | ⌘⇧O | open the session in Ghostty (a window in the layout session running `claude attach`) |
-
-On the session list: ⌃X stops a running session, ⌘⇧C copies its session id.
+| ⌃X / ⌘⇧C | stop the session / copy its session id |
 
 **Claude Status** is the menu bar half: a question mark and a count when a session needs you, with Yes / No (answered through the attached pane) and Open right in the menu. In Focus it's the only thing that tells you Claude is waiting, so turn it on.
-
-The `@` picker works from what you typed in Raycast since the last send; ⌘⇧⌫ clears the composer if the two get out of step.
 
 ## Images: pasting screenshots into a remote Claude session
 
