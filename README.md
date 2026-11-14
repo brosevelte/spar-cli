@@ -265,7 +265,7 @@ If it hangs at `Authenticating... Trying none...`, that's Tailscale SSH's `check
 
 | command | what it does |
 |---|---|
-| Claude Terminal | the real Claude Code TUI in the Raycast popover: live screen, type into its composer, paste screenshots. See "Claude Terminal" below |
+| Claude Terminal | Claude Code in the Raycast popover, like the agents view: sessions with real state, a full-width conversation, type into its composer. See "Claude Terminal" below |
 | Go to Claude | focus the mosh tab, select window `claude`, pane 1 |
 | Claude Agents Page | press the agents-view key (↓, a preference) in pane 1 — Claude Code's own "↓ to manage" view |
 | Search Claude Agents | list from `claude agents --json --all` on the box, newest first, state and age as accessories. Enter opens the job in a new tmux window (`claude --resume <session>`); other actions open the agents page, copy the session id or the resume command |
@@ -280,29 +280,29 @@ Preferences (Raycast → Extensions → Spark): ssh alias, tmux session (default
 
 ### Claude Terminal
 
-The real Claude Code TUI on the box, in a Raycast popover. Laid out like [PromptCast](https://www.raycast.com/WerrySs/codex-claude-cli): actions on the left, the live terminal on the right, the search bar on top as the keyboard. Nothing is reimplemented. Claude runs where it always does, in a tmux pane on the box. The right side is that pane drawn as an image (`tmux capture-pane -e`, rendered to SVG by `src/term-render.ts`, refreshed every 0.7s), and the search bar is **mirrored into Claude's composer on every keystroke**. So Claude's own `@` menu, slash commands, multi-line input and approval prompts all appear in the render as you type, and a half-written message survives closing Raycast because it lives in the composer on the box.
+Claude Code on the box in a Raycast popover, shaped like the TUI's agents view. Built from real values, not screen-scraping: `claude agents --json` for the sessions and their state, each session's transcript JSONL for the conversation, and a tmux pane running `claude attach <id>` for typing.
 
-Opening it lists the live Claude panes (any tmux pane running `claude`, with working / needs-you / idle) and offers "new session in" your repos. A new one is a detached tmux session `rc-<repo>` running `claude --permission-mode auto`, sized for the popover. It reopens the last session you used.
+- **Sessions (full width).** Every session on the box, grouped needs you / working / done, with age. Type a task and press Enter to dispatch a new background session (`claude --bg`, in the directory from the dropdown), as in the agents view. Enter on a session opens it.
+- **A conversation (full width).** The session's transcript drawn terminal-style (`❯` your messages, `●` Claude's, `⎿` one line per tool call), wrapped to the popover and pinned to the newest message. Under it are the live bottom rows of the TUI: its composer, `@` / slash menus, and any question Claude is asking. It is one SVG frame (`src/term-transcript.ts` → `src/term-render.ts`), refreshed about every second, shown in a one-column Grid so it spans the window and keeps a search bar.
+- **Typing.** The search bar is mirrored into the session's composer as you type. Raycast keeps its own tmux session on the box (`spark-raycast`, one window per conversation you've opened, each `claude attach <id>`). Attaching is shared: Ghostty's agents view can show the same session at the same time, and both see one composer, so a half-written message is visible in both and survives closing Raycast. Enter sends, or answers the highlighted option when Claude is asking.
 
 | key | does |
 |---|---|
-| typing | goes straight into Claude's composer |
-| Enter | Enter in Claude: send, or answer the highlighted option of a prompt |
+| typing / Enter | into Claude's composer / Enter in Claude |
+| `@` | while the bar ends in `@<partial>`, a picker of the repo's files; Enter completes the path (a directory keeps completing inside it) |
 | ⌘↵ | newline in the composer (backslash-Enter), for long messages |
-| `@` | while the bar ends in `@<partial>`, the left side lists the repo's files; Enter completes the path (a directory keeps completing inside it). Claude's own `@` menu is in the render too |
-| ⌘⇧V | upload the clipboard image to `~/clipboard` on the box and paste its path as a terminal paste, which Claude turns into `[Image #n]` |
-| ⌘1 / ⌘2 / ⌘3 | pick a prompt option (1 = yes, 3 = no) |
-| ⌘⇧↑ / ⌘⇧↓ / ⌘⇧T | Up / Down / Tab in Claude (menus) |
-| ⌘. | Escape: interrupt, or dismiss a menu |
-| ⌘⇧M | Shift-Tab: cycle the permission mode |
-| ⌥⌫ / ⌘⇧⌫ | Backspace in Claude when the bar is empty / clear Claude's input |
-| ⌥↑ / ⌥↓ | scroll back through the pane's history |
-| ⌘⇧F | full-width, read-only view |
-| ⌘⇧O | open the session in Ghostty (`spark mosh <session>`) |
+| ⌘⇧V | upload the clipboard image to `~/clipboard` on the box and paste its path, which Claude attaches as `[Image #n]` |
+| ⌘1 / ⌘2 / ⌘3 | pick an option when Claude asks (1 = yes, 3 = no) |
+| ⌘⇧↑ / ⌘⇧↓ / ⌘⇧T / ⌘. / ⌘⇧M | Up / Down / Tab / Escape (interrupt) / Shift-Tab (cycle mode) in Claude |
+| ⌥⌫ / ⌘⇧⌫ | Backspace in Claude / clear Claude's input |
+| ⌥↑ / ⌥↓ | scroll the conversation |
+| ⌘⇧O | open the session in Ghostty (a window in the layout session running `claude attach`) |
 
-**Claude Status** is the menu bar half: a question mark and a count when a session is asking you something, with Yes / No / Open right in the menu. In Focus it's the only thing that tells you Claude is waiting, so turn it on.
+On the session list: ⌃X stops a running session, ⌘⇧C copies its session id.
 
-Typing in Raycast and in Ghostty into the same composer at once confuses the mirror (it only knows what it typed). Use one at a time; ⌘⇧⌫ resets it.
+**Claude Status** is the menu bar half: a question mark and a count when a session needs you, with Yes / No (answered through the attached pane) and Open right in the menu. In Focus it's the only thing that tells you Claude is waiting, so turn it on.
+
+The mirror only knows what it typed. If you also type into the same composer from Ghostty, ⌘⇧⌫ resets both.
 
 ## Images: pasting screenshots into a remote Claude session
 

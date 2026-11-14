@@ -1,10 +1,12 @@
-// tmux on the box, for the Claude Terminal command: find the panes running Claude Code, capture one
-// (text + colours) for term-render.ts, and type into it. The TUI is the real one, so its composer,
-// @ menu, slash commands, approvals and drafts all live on the box; this side only reads the screen
-// and sends keys, over the multiplexed `spark-ctl` ssh (~40ms a call).
+// The box side of Claude Terminal, over the multiplexed `spark-ctl` ssh (~40ms a call):
+//   - sessions and their real state from `claude agents --json`
+//   - a conversation's real messages from its transcript JSONL (incrementally, by byte offset)
+//   - typing: each opened conversation gets a pane in Raycast's own tmux session running
+//     `claude attach <id>`; keys go there, and its bottom rows (composer, menus, questions) are
+//     captured for the render. Attaching is shared -- Ghostty's agents view can show the same
+//     session at once, and both see one composer -- so nothing is taken away from anyone.
 
 import { spawn } from "node:child_process";
-import path from "node:path";
 import { prefs, q, runWithInput } from "./spark";
 
 /** A non-login bash on the box, script on stdin (the remote login shell is fish; see spark.ts). */
@@ -12,94 +14,147 @@ function box(script: string, timeout = 10000): Promise<string> {
   return runWithInput("/usr/bin/ssh", [prefs.sshHost, "bash -s"], script + "\n", timeout);
 }
 
-export type PaneState = "waiting" | "working" | "idle";
+const CLAUDE = `"$HOME/.local/bin/claude"`;
+const SEP = "\u001e"; // record separator: never in a capture or a transcript
 
-export interface Pane {
-  id: string; // tmux pane id (%12): stable across renames and window moves
-  session: string;
-  window: string;
+// ---------------------------------------------------------------------------- sessions
+
+export type AgentState = "needs" | "working" | "done";
+
+export interface Agent {
+  id: string; // short id: what `claude attach` takes
+  sessionId: string;
+  name: string;
   cwd: string;
-  width: number;
-  height: number;
-  state: PaneState;
-  /** Plain text of the bottom of the screen: what a permission prompt asks, for lists and the menu bar. */
-  tail: string;
+  startedAt: number;
+  state: AgentState;
+  raw: string; // claude's own state / status words
 }
 
-// What the TUI prints in each state. Approximate by nature: the screen is the only interface.
-const WAITING = /Do you want to|Would you like to|❯ 1\. Yes|Esc to cancel/;
-const WORKING = /esc to interrupt|ctrl\+c to interrupt/i;
-
-export function paneState(text: string): PaneState {
-  if (WAITING.test(text)) return "waiting";
-  if (WORKING.test(text)) return "working";
-  return "idle";
+// `claude agents --json` says working/done and busy/idle; anything else (waiting on input or a
+// permission) counts as needing you. In a conversation, the attached pane's screen confirms it.
+function agentState(state: string, status: string): AgentState {
+  const s = `${state} ${status}`.toLowerCase();
+  if (/input|wait|block|permission|ask|attention/.test(s)) return "needs";
+  if (/working|busy|running/.test(s)) return "working";
+  return "done";
 }
 
-const SEP = "\u001e"; // record separator: never in a capture
+/** Every Claude session on the box (interactive and background, finished ones too), newest first. */
+export async function listAgents(): Promise<Agent[]> {
+  const out = await box(`${CLAUDE} agents --json --all </dev/null`, 15000);
+  const raw = JSON.parse(out || "[]") as Array<Record<string, unknown>>;
+  return raw
+    .map((a) => ({
+      id: String(a.id),
+      sessionId: String(a.sessionId),
+      name: String(a.name ?? a.id),
+      cwd: String(a.cwd ?? ""),
+      startedAt: Number(a.startedAt ?? 0),
+      state: agentState(String(a.state ?? ""), String(a.status ?? "")),
+      raw: [a.state, a.status].filter(Boolean).join(" · "),
+    }))
+    .sort((x, y) => y.startedAt - x.startedAt);
+}
 
-/** Every pane on the box whose foreground command is Claude Code, with its state. One ssh call. */
-export async function listPanes(): Promise<Pane[]> {
+/** Dispatch a new background session with `task` in `dir`, as the agents view does. Returns its short id. */
+export async function startAgent(dir: string, task: string): Promise<string> {
+  const flags = ["--permission-mode", prefs.chatPermissionMode || "auto", ...(prefs.chatModel ? ["--model", prefs.chatModel] : [])].map(q).join(" ");
+  const d = dir.startsWith("~") ? `"$HOME"${q(dir.slice(1))}` : q(dir);
+  const out = await box(`cd ${d} && ${CLAUDE} --bg ${flags} ${q(task)} </dev/null 2>&1`, 30000);
+  const m = /backgrounded\s*·\s*([0-9a-f]{6,})/.exec(out);
+  if (!m) throw new Error(out.trim().split("\n").slice(-3).join(" ") || "claude --bg printed no id");
+  return m[1];
+}
+
+export async function stopAgent(id: string): Promise<void> {
+  await box(`${CLAUDE} stop ${q(id)} </dev/null`);
+}
+
+// ---------------------------------------------------------------------------- the attached pane
+
+const RC = "spark-raycast";
+export const COLS = 92;
+const ROWS = 34;
+
+/** The pane in Raycast's tmux session attached to session `id`, created (or re-created) if needed. */
+export async function ensureAttached(id: string): Promise<string> {
+  const win = `a-${id}`;
   const out = await box(`
-tmux list-panes -a -F '#{pane_id}|#{session_name}|#{window_name}|#{pane_current_command}|#{pane_current_path}|#{pane_width}|#{pane_height}' 2>/dev/null |
-while IFS='|' read -r id s w cmd cwd pw ph; do
-  [ "$cmd" = claude ] || continue
-  printf 'P|%s|%s|%s|%s|%s|%s\\n' "$id" "$s" "$w" "$cwd" "$pw" "$ph"
-  tmux capture-pane -p -t "$id" | sed '/^[[:space:]]*$/d' | tail -n 14
-  printf '${SEP}\\n'
-done`);
-  const panes: Pane[] = [];
-  for (const block of out.split(SEP + "\n")) {
-    const [head, ...rest] = block.split("\n");
-    if (!head?.startsWith("P|")) continue;
-    const [, id, session, window, cwd, w, h] = head.split("|");
-    const tail = rest.join("\n");
-    panes.push({ id, session, window, cwd, width: Number(w), height: Number(h), state: paneState(tail), tail });
-  }
-  return panes;
+tmux has-session -t =${RC} 2>/dev/null || tmux new-session -d -s ${RC} -x ${COLS} -y ${ROWS} -n home
+p=$(tmux list-panes -s -t =${RC} -F '#{window_name} #{pane_id} #{pane_dead}' | awk '$1=="${win}" && $3=="0" {print $2; exit}')
+if [ -z "$p" ]; then
+  tmux kill-window -t =${RC}:${win} 2>/dev/null
+  p=$(tmux new-window -d -t =${RC}: -n ${win} -P -F '#{pane_id}' "${CLAUDE.replace(/"/g, "")} attach ${id.replace(/[^0-9a-zA-Z-]/g, "")}")
+  tmux resize-window -t "$p" -x ${COLS} -y ${ROWS} 2>/dev/null
+fi
+echo "$p"`);
+  return out.trim().split("\n").pop()!;
 }
 
-export interface Snapshot {
-  lines: string[];
-  cols: number;
-  cursor?: { x: number; y: number };
-  state: PaneState;
-  scrolled: number;
+export interface Poll {
+  size: number; // transcript bytes: the next call's offset
+  chunk: string; // transcript lines added since the offset (its last 3MB on the first call)
+  bottom: string[]; // the attached pane's bottom rows, with escapes
+  cursor?: { x: number; y: number }; // within `bottom`
+  needs: boolean; // the pane is asking something (permission prompt, choice)
 }
 
-const plain = (l: string) => l.replace(/\x1b\[[0-9;:?]*[A-Za-z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
+const NEEDS = /Do you want to|Would you like to|❯ 1\. |Esc to cancel|Enter to select/;
+const plainLine = (l: string) => l.replace(/\x1b\[[0-9;:?]*[A-Za-z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
 
 /**
- * The pane's screen, `scroll` lines back from the live view. Only a window of rows is kept --
- * ending at the last non-empty row, about half as tall as the pane is wide -- because the detail
- * pane scales the image to its width: a 94-row pane drawn whole would be unreadably small.
+ * One round trip for the conversation view: what the transcript gained since `offset`, and the
+ * bottom of the attached pane -- just the composer box normally, more rows when it shows a menu or
+ * asks a question (up to `rows`).
  */
-export async function snapshot(id: string, scroll = 0): Promise<Snapshot> {
-  const t = q(id);
-  const range = scroll > 0 ? `-S -${scroll} -E $(( $(tmux display -p -t ${t} '#{pane_height}') - 1 - ${scroll} ))` : "";
-  const out = await box(`tmux display -p -t ${t} '#{pane_width} #{pane_height} #{cursor_x} #{cursor_y}' && tmux capture-pane -p -e -t ${t} ${range}`);
-  const nl = out.indexOf("\n");
-  const [cols, , cx, cy] = out.slice(0, nl).split(" ").map(Number);
-  const lines = out.slice(nl + 1).split("\n");
+export async function poll(sessionId: string, offset: number, pane: string | undefined, rows: number): Promise<Poll> {
+  const t = pane ? q(pane) : "";
+  const out = await box(
+    `
+f=$(ls -t ~/.claude/projects/*/${q(sessionId)}.jsonl 2>/dev/null | head -1)
+size=0; [ -n "$f" ] && size=$(stat -c %s "$f")
+echo "$size"
+${pane ? `tmux display -p -t ${t} '#{cursor_x} #{cursor_y}' 2>/dev/null || echo "0 0"` : `echo "0 0"`}
+printf '${SEP}\\n'
+${pane ? `tmux capture-pane -p -e -t ${t} 2>/dev/null` : ""}
+printf '${SEP}\\n'
+if [ -n "$f" ]; then
+  if [ ${offset} -eq 0 ]; then tail -c 3000000 "$f"; elif [ "$size" -gt ${offset} ]; then tail -c +$((${offset} + 1)) "$f"; fi
+fi`,
+    20000,
+  );
+  const [head, screen = "", chunk = ""] = out.split(SEP + "\n");
+  const [sizeLine, geo = "0 0"] = head.split("\n");
+  const [cx, cy] = geo.split(" ").map(Number);
+  const lines = screen.split("\n");
   if (lines[lines.length - 1] === "") lines.pop();
   let last = lines.length - 1;
-  while (last > 0 && !plain(lines[last]).trim()) last--;
-  if (scroll === 0) last = Math.max(last, Math.min(cy, lines.length - 1));
-  const rows = Math.max(24, Math.round(cols / 2));
-  const start = Math.max(0, last + 1 - rows);
-  const shown = lines.slice(start, last + 1);
+  while (last > 0 && !plainLine(lines[last]).trim()) last--;
+  last = Math.max(last, Math.min(cy, lines.length - 1));
+  const tail = lines.slice(0, last + 1);
+  const plainTail = tail.map(plainLine);
+  const needs = NEEDS.test(plainTail.slice(-rows).join("\n"));
+  // The composer is boxed by the last two rule lines; a menu (@, /) sits just above the box.
+  const rules = plainTail.map((l, i) => (/^─{8,}/.test(l.trim()) ? i : -1)).filter((i) => i >= 0);
+  const boxTop = rules.length >= 2 ? rules[rules.length - 2] : Math.max(0, tail.length - 4);
+  let start = boxTop;
+  while (start > 0 && start > tail.length - rows && /^\s{2,}\S/.test(plainTail[start - 1]) && !/^\s*$/.test(plainTail[start - 1])) start--;
+  if (needs) start = Math.max(0, tail.length - rows);
   return {
-    lines: shown,
-    cols,
-    cursor: scroll === 0 ? { x: cx, y: cy - start } : undefined,
-    state: paneState(shown.slice(-16).map(plain).join("\n")),
-    scrolled: scroll,
+    size: Number(sizeLine) || 0,
+    chunk,
+    bottom: tail.slice(start),
+    cursor: pane && cy >= start ? { x: cx, y: cy - start } : undefined,
+    needs,
   };
 }
 
+// ---------------------------------------------------------------------------- typing
+
 /**
- * Bring the TUI's composer from `from` to `to` in one call: backspace over what changed, type the
- * rest literally. The search bar mirrors into the composer this way on every keystroke.
+ * Bring the composer from what we last typed to what the search bar now says: backspace over the
+ * changed tail, type the rest literally. The search bar mirrors into the composer this way.
  */
 export async function retype(id: string, backspaces: number, text: string): Promise<void> {
   const cmds: string[] = [];
@@ -108,36 +163,22 @@ export async function retype(id: string, backspaces: number, text: string): Prom
   if (cmds.length) await box(cmds.join(" && "));
 }
 
-/** tmux key names: Enter, Escape, Up, Down, Tab, BTab, BSpace, C-c, C-u, or a literal digit. */
+/** tmux key names: Enter, Escape, Up, Down, Tab, BTab, BSpace, C-u, or a literal digit. */
 export async function keys(id: string, ...names: string[]): Promise<void> {
   await box(`tmux send-keys -t ${q(id)} ${names.map(q).join(" ")}`);
 }
 
-/** Paste as the terminal would (bracketed): the TUI turns a pasted image path into an attachment. */
+/** Paste as a terminal would (bracketed): Claude turns a pasted image path into an attachment. */
 export async function paste(id: string, text: string): Promise<void> {
   await box(`tmux set-buffer -b spark-rc -- ${q(text)} && tmux paste-buffer -p -d -b spark-rc -t ${q(id)}`);
 }
 
-/** A newline in the composer without sending: the TUI reads backslash-Enter as one. */
+/** A newline in the composer without sending: Claude reads backslash-Enter as one. */
 export async function newline(id: string): Promise<void> {
   await box(`tmux send-keys -t ${q(id)} -l -- '\\' && tmux send-keys -t ${q(id)} Enter`);
 }
 
-/** A detached tmux session running Claude in `dir`, sized for the detail pane. Returns its pane id. */
-export async function newSession(dir: string): Promise<string> {
-  const base = "rc-" + (path.basename(dir.replace(/\/+$/, "")) || "home").replace(/[^A-Za-z0-9_-]/g, "-");
-  const claude = ["claude", "--permission-mode", prefs.chatPermissionMode || "auto", ...(prefs.chatModel ? ["--model", prefs.chatModel] : [])].map(q).join(" ");
-  const out = await box(`
-d=${dir.startsWith("~") ? `"$HOME"${q(dir.slice(1))}` : q(dir)}
-n=${q(base)}; i=2; while tmux has-session -t "=$n" 2>/dev/null; do n=${q(base)}-$i; i=$((i+1)); done
-tmux new-session -d -s "$n" -x 96 -y 48 -c "$d" -P -F '#{pane_id}'
-tmux send-keys -t "$n" ${q(claude)} Enter`);
-  return out.trim().split("\n")[0];
-}
-
-export async function killSession(session: string): Promise<void> {
-  await box(`tmux kill-session -t ${q("=" + session)}`);
-}
+// ---------------------------------------------------------------------------- files and images
 
 export interface FileIndex {
   files: string[];

@@ -177,8 +177,8 @@ const CW = FONT * 0.6;
 const LH = Math.round(FONT * 1.32);
 const PAD = 14;
 
-/** The screen as an SVG data-URI image in markdown, ready for a List.Item.Detail. */
-export function screenMarkdown(screen: Screen, header?: string): string {
+/** The screen as an SVG document. */
+export function screenSvg(screen: Screen, header?: string): string {
   const rows = screen.lines.length;
   const width = Math.ceil(screen.cols * CW + PAD * 2);
   const top = PAD + (header ? LH : 0);
@@ -223,5 +223,10 @@ export function screenMarkdown(screen: Screen, header?: string): string {
     out.push(`<rect x="${x.toFixed(1)}" y="${top + screen.cursor.y * LH + 2}" width="${CW.toFixed(1)}" height="${LH - 3}" fill="#7ee787" opacity="0.7"/>`);
   }
   out.push("</g></svg>");
-  return `![terminal](data:image/svg+xml;base64,${Buffer.from(out.join(""), "utf8").toString("base64")})`;
+  return out.join("");
+}
+
+/** The screen as an SVG data-URI image in markdown, for a detail pane. */
+export function screenMarkdown(screen: Screen, header?: string): string {
+  return `![terminal](data:image/svg+xml;base64,${Buffer.from(screenSvg(screen, header), "utf8").toString("base64")})`;
 }
