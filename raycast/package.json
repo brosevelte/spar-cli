@@ -64,6 +64,30 @@
       "title": "Go to Repo",
       "description": "cd the shell pane into a repo under ~/src on the Spark",
       "mode": "view"
+    },
+    {
+      "name": "open-ref",
+      "title": "Open Ticket or PR",
+      "description": "TEC-4336 opens the Linear issue; 4228 or BE-4228 opens the ultron-framework PR and FE-2030 the replit-avengetron PR in Graphite",
+      "mode": "no-view",
+      "arguments": [
+        {
+          "name": "ref",
+          "type": "text",
+          "placeholder": "TEC-4336, BE-4228, FE-2030",
+          "required": true
+        }
+      ],
+      "preferences": [
+        {
+          "name": "browser",
+          "title": "Browser",
+          "description": "App to open links in (blank = default browser)",
+          "type": "textfield",
+          "default": "Dia",
+          "required": false
+        }
+      ]
     }
   ],
   "preferences": [

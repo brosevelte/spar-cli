@@ -1721,7 +1721,7 @@ def raycast_install() -> None:
     _register_raycast_extension()
     _run(["ssh", CTL_HOST, "true"], check=False)  # warm the control socket so the first Raycast call is fast
     typer.secho(
-        "Raycast extension 'Spark' installed. Commands: Go to Claude, Claude Agents Page, Search Claude Agents, Search Claude Sessions, New Claude Session, Go to Shell Pane, Go to Repo. "
+        "Raycast extension 'Spark' installed. Commands: Go to Claude, Claude Agents Page, Search Claude Agents, Search Claude Sessions, New Claude Session, Go to Shell Pane, Go to Repo, Open Ticket or PR. "
         f"Its tmux session preference defaults to c1; set it to tmux_session ({c.tmux_session}) if they differ.",
         fg="green",
     )
