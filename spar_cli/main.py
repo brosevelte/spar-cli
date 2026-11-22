@@ -419,6 +419,21 @@ def _sso_token_cache_name(profile: str) -> str:
     return hashlib.sha1(key.encode()).hexdigest() + ".json"
 
 
+def _sso_start_url(profile: str) -> str:
+    """The Identity Center access-portal URL behind this profile (its sso-session's `sso_start_url`, or the
+    profile's own for a legacy profile), so `--fresh` can say exactly which browser tab to sign out of."""
+    parser = configparser.ConfigParser()
+    parser.read(Path.home() / ".aws" / "config")
+    name = "default" if profile == "default" else f"profile {profile}"
+    sec = parser[name] if parser.has_section(name) else {}
+    if url := sec.get("sso_start_url"):
+        return url
+    session = sec.get("sso_session")
+    if session and parser.has_section(f"sso-session {session}"):
+        return parser[f"sso-session {session}"].get("sso_start_url", "")
+    return ""
+
+
 def _aws_report(c: cfg.Config, profiles: list[str]) -> bool:
     """Verify each profile ON THE BOX and print which role it resolves to, plus how long the shared
     SSO sign-in has left. The sign-in is what matters for long jobs: while it is alive the CLI
@@ -485,6 +500,12 @@ def auth_aws(
     profile: str = typer.Option(None, help="SSO profile to log in with locally (default: aws_profile from config)"),
     region: str = typer.Option(None, help="AWS_REGION to set on the Spark (default: aws_region from config)"),
     skip_login: bool = typer.Option(False, help="only copy the existing cache, don't run aws sso login"),
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="end the current sign-in first (aws sso logout + browser portal sign-out) so the new one gets a full "
+        "Identity Center session instead of inheriting the old session's remaining hours",
+    ),
     check: bool = typer.Option(
         False,
         "--check",
@@ -496,6 +517,8 @@ def auth_aws(
     Sharing the sign-in is safe and deliberate. Identity Center does not rotate or invalidate a refresh token on use (verified 2026-09-26, and again 2026-10-10: the box renewed its copy 17h after the laptop had renewed the same one). What ends a sign-in on BOTH machines at once is the Identity Center portal-session lifetime, which no local file records -- `aws-sso-state` probes for it (see dotfiles/aws-sso-state.sh). A 2026-10-09 rewrite had the box mint its own sign-in via device code on a "competing lineage" theory; that doubled the logins, added a device-code step, and fixed nothing, so it was reverted.
 
     With `aws_batch_profile` set, one sign-in covers both profiles (they share an `sso-session`), and both are verified on the box. AWS_PROFILE stays the interactive profile; long jobs opt in with AWS_PROFILE=<batch profile>. `--check` is the pre-flight for a multi-hour run.
+
+    `--fresh` is for "give me the whole day now". A plain re-run mints a new token, but the browser approves it against the portal session it is already signed in to, so the new token dies when that session does -- re-running two hours before expiry buys nothing. `--fresh` runs `aws sso logout` (deletes the local cache and calls Identity Center's Logout API, ending the server-side sign-in) and pauses so you can sign out of the access portal in the browser, or have a private window ready; only then does the login start a new session. The box is signed out from the logout until the push a minute later, so don't do it in the middle of a long job.
     """
     c = cfg.load()
     profile = profile or c.aws_profile or os.environ.get("AWS_PROFILE", "")
@@ -503,9 +526,22 @@ def auth_aws(
     if not profile:
         raise typer.BadParameter("no SSO profile: pass --profile, set aws_profile in the config, or export AWS_PROFILE")
     profiles = [profile] + ([c.aws_batch_profile] if c.aws_batch_profile else [])
+    if fresh and (check or skip_login):
+        raise typer.BadParameter("--fresh signs in again; it can't be combined with --check or --skip-login")
 
     if not check:
         aws_dir = Path.home() / ".aws"
+        if fresh:
+            _run(["aws", "sso", "logout", "--profile", profile])
+            portal = _sso_start_url(profile)
+            typer.secho(
+                "Signed out of Identity Center. Now sign out of the AWS access portal in your browser"
+                + (f" ({portal})" if portal else "")
+                + ", or copy the login URL into a private window when it appears -- a browser still signed in "
+                "would attach the new token to the old session.",
+                fg="yellow",
+            )
+            typer.prompt("Press Enter to sign in", default="", show_default=False, prompt_suffix="")
         if not skip_login:
             _run(["aws", "sso", "login", "--profile", profile])
         _remote(c, "mkdir -p ~/.aws/sso/cache && chmod 700 ~/.aws")
