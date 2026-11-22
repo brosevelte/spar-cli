@@ -580,6 +580,15 @@ def auth_aws(
             "gateway there — cached boto3 clients don't rebind.",
             fg="green",
         )
+    if not fresh:
+        portal = _sso_start_url(profile)
+        typer.secho(
+            "Tip: this sign-in lasts only as long as your browser's AWS portal session. For a full new session, "
+            "sign out of the portal"
+            + (f" ({portal})" if portal else "")
+            + " first, then run `spark auth aws`.",
+            fg="bright_black",
+        )
 
 
 @auth_app.command("mcp")
