@@ -33,9 +33,12 @@ HOOKS: dict[str, list[dict]] = {
     "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [_cmd("stash")]}],
     "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [_cmd("clear")]}],
     "PermissionRequest": [{"hooks": [_cmd("stash")]}],
+    # No idle_prompt entry, on purpose: "Claude is waiting for your input" fires after every turn,
+    # including every wake by a background agent, and was pure noise (Carter, 2026-11-23). A ping
+    # means a question or a permission request; a session that has finished says so itself with a
+    # card (see the away-mode skill). `cc-slack-hook idle` still exists for anyone who wants it back.
     "Notification": [
         {"matcher": "permission_prompt|elicitation_dialog|agent_needs_input", "hooks": [_cmd("notify")]},
-        {"matcher": "idle_prompt", "hooks": [_cmd("idle")]},
     ],
     "UserPromptSubmit": [{"hooks": [_cmd("reset")]}],
 }
