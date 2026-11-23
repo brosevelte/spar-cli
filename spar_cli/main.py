@@ -648,8 +648,10 @@ def auth_drive(
     )
 
 
-# The authorize URL `claude auth login` prints; opened locally by `spark auth claude`.
-CLAUDE_AUTH_URL = r"https://claude\.com/cai/oauth/authorize\?"
+# The authorize URL `claude auth login` prints; opened locally by `spark auth claude`. Claude Code
+# has moved it before (claude.com/cai/... until ~2.1.330, claude.ai/... since), so accept every host
+# the binary carries rather than pinning one and silently never opening the browser.
+CLAUDE_AUTH_URL = r"https://(?:claude\.ai|claude\.com/cai|platform\.claude\.com)/oauth/authorize\?"
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 
