@@ -584,9 +584,7 @@ def auth_aws(
         portal = _sso_start_url(profile)
         typer.secho(
             "Tip: this sign-in lasts only as long as your browser's AWS portal session. For a full new session, "
-            "sign out of the portal"
-            + (f" ({portal})" if portal else "")
-            + " first, then run `spark auth aws`.",
+            "sign out of the portal" + (f" ({portal})" if portal else "") + " first, then run `spark auth aws`.",
             fg="bright_black",
         )
 
@@ -680,6 +678,132 @@ def auth_claude(
         stdin=creds,
     )
     _remote(c, "claude auth status")
+
+
+# --------------------------------------------------------------------------- slack
+#
+# One Slack app ("Claude Code", bot scope chat:write) for the team; each dev keeps its bot token on
+# their own machines and picks where pings go. On the Mac the token lives in the login Keychain. On
+# the box it is a chmod 600 file: the GNOME keyring there only unlocks at a graphical login, so over
+# ssh (and after every reboot) a lookup hangs on an invisible unlock dialog -- the reason gh is
+# wrapped (dotfiles/gh-wrapper.sh) -- and a ping that silently never arrives is the failure that
+# matters for "ping me while I'm away". Both are read by dotfiles/cc-slack.sh.
+
+SLACK_KEYCHAIN_SERVICE = "spar-cli-slack"  # must match KEYCHAIN_SERVICE in dotfiles/cc-slack.sh
+SLACK_DIR = ".config/claude-notify"  # under $HOME on both machines: `token` (box only) and `target`
+
+
+def _slack_keychain_get() -> str | None:
+    r = subprocess.run(
+        ["security", "find-generic-password", "-s", SLACK_KEYCHAIN_SERVICE, "-w"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    return r.stdout.strip() or None if r.returncode == 0 else None
+
+
+def _slack_keychain_set(token: str) -> None:
+    # `security -i` reads the command from stdin, so the token never appears on an argv (`ps`).
+    # -U updates the item in place on a rotation.
+    cmd = f"add-generic-password -U -s {SLACK_KEYCHAIN_SERVICE} -a {shlex.quote(os.environ.get('USER', 'spark'))} -w {token}\n"
+    subprocess.run(["security", "-i"], input=cmd, text=True, check=True, capture_output=True)
+
+
+def _slack_auth_test(token: str) -> dict:
+    import urllib.request
+
+    req = urllib.request.Request(
+        "https://slack.com/api/auth.test", method="POST", headers={"Authorization": f"Bearer {token}"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+@auth_app.command("slack")
+def auth_slack(
+    target: str = typer.Option(
+        None,
+        "--target",
+        help="where pings go on BOTH machines: your Slack member ID (U...) for a DM, or a channel ID (C...) the bot is in",
+    ),
+    rotate: bool = typer.Option(False, "--rotate", help="prompt for a new token even if the Keychain has one"),
+    check: bool = typer.Option(
+        False, "--check", help="no changes: auth.test from both machines, exit 1 if either fails"
+    ),
+    test: bool = typer.Option(True, "--test/--no-test", help="send a test message from each machine at the end"),
+) -> None:
+    """Put the Claude Code Slack bot token on this Mac and the Spark, and install `cc-slack` on both. The token is prompted for (hidden) the first time and stored in this Mac's login Keychain; after that the Keychain copy is reused, so a re-run just re-pushes it (`--rotate` to replace it). On the box it is written to `~/.config/claude-notify/token`, chmod 600 -- not the box's GNOME keyring, which is locked over ssh and after every reboot. `--target` writes `~/.config/claude-notify/target` on both machines (`CC_SLACK_TARGET` overrides it per shell). Then `cc-slack "msg"` posts from either machine, and Claude Code's Notification hook can call it."""
+    if platform.system() != "Darwin":
+        raise typer.BadParameter("the laptop-side token store is the macOS Keychain; run this from the Mac")
+    c = cfg.load()
+    if check:
+        local = subprocess.run([str(Path.home() / ".local/bin/cc-slack"), "--check"], check=False).returncode
+        remote = _remote_rc(c, "cc-slack --check")
+        raise typer.Exit(0 if local == remote == 0 else 1)
+
+    if target is not None and not (target[:1] in "UWCGD" and target[1:].isalnum() and target.isupper()):
+        raise typer.BadParameter("--target wants a Slack ID like U0123ABCD (DM) or C0123ABCD (channel), not a name")
+
+    token = None if rotate else _slack_keychain_get()
+    fresh = token is None
+    if fresh:
+        typer.secho(
+            "Bot User OAuth Token (xoxb-...) from api.slack.com/apps -> your app -> OAuth & Permissions.",
+            fg="bright_black",
+        )
+        # Prompted, never a flag, so it stays out of shell history.
+        token = typer.prompt("Slack bot token", hide_input=True).strip()
+    if not token.startswith("xoxb-"):
+        raise typer.BadParameter("that isn't a bot token (xoxb-...); user tokens (xoxp-) would post as you")
+    who = _slack_auth_test(token)
+    if not who.get("ok"):
+        raise typer.BadParameter(f"Slack rejected the token: {who.get('error')}")
+    typer.secho(f"token live: bot {who.get('user')} in {who.get('team')}", fg="green")
+    if fresh:
+        _slack_keychain_set(token)
+        typer.echo(f"  stored in the login Keychain (service {SLACK_KEYCHAIN_SERVICE})")
+
+    _run(
+        [*_ssh_base(c), _bash(f"umask 077 && mkdir -p ~/{SLACK_DIR} && cat > ~/{SLACK_DIR}/token")],
+        stdin=token + "\n",
+    )
+    typer.echo(f"  pushed to {c.name}:~/{SLACK_DIR}/token (600)")
+
+    local_dir = Path.home() / SLACK_DIR
+    if target:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "target").write_text(target + "\n")
+        _remote(c, f"mkdir -p ~/{SLACK_DIR} && printf '%s\\n' {shlex.quote(target)} > ~/{SLACK_DIR}/target")
+        typer.echo(f"  target {target} on both machines")
+    elif not (local_dir / "target").exists():
+        typer.secho(
+            "  no target yet: re-run with --target <your member ID> (Slack profile -> ... -> Copy member ID)",
+            fg="yellow",
+        )
+
+    # The sender itself, same file on both sides (also installed by `sync dotfiles` and the bootstrap).
+    local_bin = Path.home() / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    _run(["install", "-m", "755", str(DOTFILES / "cc-slack.sh"), str(local_bin / "cc-slack")])
+    _remote(c, "mkdir -p ~/.local/bin")
+    _run([*_scp(c), str(DOTFILES / "cc-slack.sh"), f"{c.target}:~/.local/bin/cc-slack"])
+    _remote(c, "chmod 755 ~/.local/bin/cc-slack")
+
+    if test and (target or (local_dir / "target").exists()):
+        msg = "spark auth slack: test from {}"
+        local = subprocess.run([str(local_bin / "cc-slack"), msg.format(platform.node())], check=False).returncode
+        remote = _remote_rc(c, "cc-slack " + shlex.quote(msg.format(c.name)))
+        ok = local == remote == 0
+        typer.secho(
+            "test pings sent from both machines" if ok else "a test ping failed (see above)",
+            fg="green" if ok else "red",
+        )
+        raise typer.Exit(0 if ok else 1)
+
+
+def _remote_rc(c: cfg.Config, script: str) -> int:
+    return _run([*_ssh_base(c), _bash(REMOTE_PATH + script, login=True)], check=False).returncode
 
 
 # --------------------------------------------------------------------------- gcp
@@ -1624,9 +1748,10 @@ DOTFILE_BINS = {
     "tmux-osc52.sh": "tmux-osc52",
     "aws-sso-state.sh": "aws-sso-state",
     "gcp-auth-state.sh": "gcp-auth-state",
+    "cc-slack.sh": "cc-slack",
 }
-# Read by the shared starship.toml, so it has to exist on the laptop too.
-LAPTOP_BINS = {"aws-sso-state.sh": "aws-sso-state", "gcp-auth-state.sh": "gcp-auth-state"}
+# Called on both machines: the state scripts by the shared starship.toml, cc-slack by Claude Code's hooks.
+LAPTOP_BINS = {"aws-sso-state.sh": "aws-sso-state", "gcp-auth-state.sh": "gcp-auth-state", "cc-slack.sh": "cc-slack"}
 # The bootstrap copies tmux.conf only when the box has none; sync pushes it unconditionally and re-sources it.
 TMUX_CONF = "tmux.conf"
 # Sampler for sparkbar's history; runs under the systemd user manager so it keeps sampling while no tmux client is attached.

@@ -212,6 +212,7 @@ if [ -n "$SELF_DOTFILES" ] && [ -d "$SELF_DOTFILES" ]; then
   install -m 755 "$SELF_DOTFILES/tmux-osc52.sh" "$HOME/.local/bin/tmux-osc52"
   install -m 755 "$SELF_DOTFILES/aws-sso-state.sh" "$HOME/.local/bin/aws-sso-state"
   install -m 755 "$SELF_DOTFILES/gcp-auth-state.sh" "$HOME/.local/bin/gcp-auth-state"
+  install -m 755 "$SELF_DOTFILES/cc-slack.sh" "$HOME/.local/bin/cc-slack"
   # sparkbar's sampler: keeps vitals history rolling while no tmux client is attached.
   mkdir -p "$HOME/.config/systemd/user"
   install -m 644 "$SELF_DOTFILES/sparkbar-sampler.service" "$HOME/.config/systemd/user/sparkbar-sampler.service"
