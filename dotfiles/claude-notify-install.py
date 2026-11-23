@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Install the Claude Code side of Slack pings on THIS machine: the Notification hook that pipes
-into cc-slack, and the /away-mode skill. Run on both the Mac and the box by `spark auth slack`,
-`spark sync dotfiles` and `spark bootstrap --user`; stdlib only, so the box's system python3 runs it.
+"""Install the Claude Code side of Slack pings on THIS machine: the hooks that call cc-slack-hook,
+and the /away-mode skill. Run on both the Mac and the box by `spark auth slack`, `spark sync
+dotfiles` and `spark bootstrap --user`; stdlib only, so the box's system python3 runs it.
 
     claude-notify-install.py <dir holding claude-skills/>
 
-settings.json is merged, never overwritten: other keys and other hooks (the box's PreToolUse block)
-are left alone. An existing Notification entry whose command ends in `cc-slack` is replaced in
-place, and any duplicates of it are dropped -- two entries would deliver every ping twice. A
-settings.json that isn't valid JSON is an error and nothing is changed. When the merged result
-equals what is there, the file is not rewritten at all.
+settings.json is merged, never overwritten: other keys and other hook entries (the box's PreToolUse
+"Bash" block) are left exactly as they are. An entry is ours if any of its commands contains
+`cc-slack`; every run removes all of ours from the events below and appends the current set, so it
+is idempotent and migrates older shapes away (the first version was one inline `jq -r ... | cc-slack`
+Notification entry). A settings.json that isn't valid JSON is an error and nothing is changed. When
+the merged result equals what is there, the file is not rewritten at all.
 """
 
 from __future__ import annotations
@@ -21,47 +22,41 @@ import sys
 import tempfile
 from pathlib import Path
 
-HOOK = {
-    "matcher": "permission_prompt|idle_prompt|elicitation_dialog|agent_needs_input",
-    "hooks": [
-        {
-            "type": "command",
-            "command": (
-                'jq -r \'"Claude Code needs you in " + (.cwd | split("/") | last) + ": " '
-                '+ (.message // "waiting for input")\' | "$HOME"/.local/bin/cc-slack'
-            ),
-        }
+
+def _cmd(kind: str) -> dict:
+    return {"type": "command", "command": f'"$HOME"/.local/bin/cc-slack-hook {kind}'}
+
+
+# event -> our entries, appended after whatever else the event holds. Copied from the box, where it
+# was installed and tested by hand; see dotfiles/cc-slack-hook.sh for what each kind does.
+HOOKS: dict[str, list[dict]] = {
+    "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [_cmd("stash")]}],
+    "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [_cmd("clear")]}],
+    "PermissionRequest": [{"hooks": [_cmd("stash")]}],
+    "Notification": [
+        {"matcher": "permission_prompt|elicitation_dialog|agent_needs_input", "hooks": [_cmd("notify")]},
+        {"matcher": "idle_prompt", "hooks": [_cmd("idle")]},
     ],
+    "UserPromptSubmit": [{"hooks": [_cmd("reset")]}],
 }
 SKILLS = ("away-mode",)
 
 
 def _is_ours(entry: object) -> bool:
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
         return False
-    return any(
-        isinstance(h, dict) and str(h.get("command", "")).rstrip().endswith("cc-slack") for h in entry.get("hooks", [])
-    )
+    return any(isinstance(h, dict) and "cc-slack" in str(h.get("command", "")) for h in entry["hooks"])
 
 
 def merge(settings: dict) -> dict:
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise TypeError("settings.json: `hooks` is not an object")
-    notif = hooks.get("Notification", [])
-    if not isinstance(notif, list):
-        raise TypeError("settings.json: `hooks.Notification` is not a list")
-    out, placed = [], False
-    for entry in notif:
-        if _is_ours(entry):
-            if not placed:
-                out.append(HOOK)
-                placed = True
-            continue
-        out.append(entry)
-    if not placed:
-        out.append(HOOK)
-    hooks["Notification"] = out
+    for event, ours in HOOKS.items():
+        entries = hooks.get(event, [])
+        if not isinstance(entries, list):
+            raise TypeError(f"settings.json: `hooks.{event}` is not a list")
+        hooks[event] = [e for e in entries if not _is_ours(e)] + json.loads(json.dumps(ours))
     return settings
 
 
@@ -82,7 +77,7 @@ def install_hook(path: Path) -> str:
     except TypeError as e:
         raise SystemExit(f"claude-notify: {e} -- nothing changed") from None
     if json.dumps(merged, sort_keys=True) == before:
-        return f"hook already installed in {path} (unchanged)"
+        return f"hooks already installed in {path} (unchanged)"
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".settings.", suffix=".json")
     with os.fdopen(fd, "w") as fh:
@@ -91,7 +86,7 @@ def install_hook(path: Path) -> str:
     if path.exists():
         os.chmod(tmp, path.stat().st_mode & 0o777)
     os.replace(tmp, path)
-    return f"hook installed in {path}"
+    return f"hooks installed in {path}"
 
 
 def main() -> int:
@@ -107,7 +102,10 @@ def main() -> int:
         shutil.copyfile(src / "claude-skills" / name / "SKILL.md", dest)
         print(f"claude-notify: skill /{name} -> {dest}")
     if not shutil.which("jq"):
-        print("claude-notify: WARNING jq is not installed -- the hook needs it, no pings until it is", file=sys.stderr)
+        print(
+            "claude-notify: WARNING jq is not installed -- cc-slack-card and cc-slack-hook need it, no pings until it is",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

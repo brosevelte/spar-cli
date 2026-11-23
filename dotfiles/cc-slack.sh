@@ -66,7 +66,13 @@ fi
 if [ $# -gt 0 ]; then text="$*"; else text=$(cat); fi
 [ -n "$text" ] || { echo "cc-slack: empty message" >&2; exit 2; }
 
-out=$(api chat.postMessage --data-urlencode "channel=$target" --data-urlencode "text=$text")
+# $CC_SLACK_BLOCKS: optional Block Kit JSON array (cc-slack-card sets it). The text is then the fallback
+# that phone push notifications show.
+args=(--data-urlencode "channel=$target" --data-urlencode "text=$text")
+if [ -n "${CC_SLACK_BLOCKS:-}" ]; then
+  args+=(--data-urlencode "blocks=$CC_SLACK_BLOCKS")
+fi
+out=$(api chat.postMessage "${args[@]}")
 case $out in
 *'"ok":true'*) exit 0 ;;
 *)

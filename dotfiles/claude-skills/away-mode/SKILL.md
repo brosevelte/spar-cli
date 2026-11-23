@@ -22,19 +22,26 @@ The developer reaches Claude Code over SSH from a phone and gets no native notif
 - **When the work finishes or fully stalls,** send one closing message: what landed, what is waiting on them.
 - **Never put a secret, token or customer data in a message.** Name the file or record instead.
 
-Message shape (plain text; Slack renders `*bold*` and backticks):
+Send every question as a card with `cc-slack-card`, the same layout the notification hook uses: a header (icon and short title), then a quoted block with the question in bold, an optional line of situation and one bullet per option, then the session's name in italics. You supply JSON; the script does the layout and signs it with the session's name.
 
+- `title`: two to four words naming the topic. `icon` (Slack shortcode): `:question:` a question or ruling, `:lock:` something that needs their go-ahead, `:white_check_mark:` the closing message, `:warning:` the work has stalled.
+- `question`: one sentence. `detail`: one line of situation, if the question needs it. `options`: one string each, saying what it changes and costs, with yours marked "(my recommendation)". `code`: a command or path to show in a code block.
+- Backticks inside `question`, `detail` and `options` render as inline code.
+- One card per question. Do not add an "answer in the session" line.
+
+Write the JSON to `/scratch/away-mode/card.json` and run `cc-slack-card < /scratch/away-mode/card.json`:
+
+```json
+{"icon": ":question:", "title": "Upload size limit",
+ "question": "What should happen to PDFs over 25 MB at classifier upload?",
+ "detail": "Today the upload fails with a 500.",
+ "options": ["Reject at upload with a clear error (my recommendation). About 10 lines.",
+             "Chunk the upload. New code path, about a day."]}
 ```
-*ultron-framework* needs a ruling (1 of 1)
-The classifier upload fails for PDFs over 25 MB. Options:
-A) reject at upload with a clear error (10 lines, my recommendation)
-B) chunk the upload (new code path, about a day)
-Answer in the session; I'm continuing with the tests meanwhile.
-```
 
-Send long text on stdin so quoting cannot mangle it: write the message to `/scratch/away-mode/msg.txt` and run `cc-slack < /scratch/away-mode/msg.txt`.
+Plain `cc-slack "text"` is only for the one-line "Away mode on" message.
 
-If `cc-slack` exits non-zero, do not retry in a loop: put the error in the session and carry on; the hook's idle ping is the fallback.
+If `cc-slack-card` or `cc-slack` exits non-zero, do not retry in a loop: put the error in the session and carry on; the hook's idle ping is the fallback.
 
 ## Turning it off
 

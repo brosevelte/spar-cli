@@ -691,6 +691,8 @@ def auth_claude(
 
 SLACK_KEYCHAIN_SERVICE = "spar-cli-slack"  # must match KEYCHAIN_SERVICE in dotfiles/cc-slack.sh
 SLACK_DIR = ".config/claude-notify"  # under $HOME on both machines: `token` (box only) and `target`
+# dotfiles/<name>.sh -> ~/.local/bin/<name> on both machines. cc-slack-card and cc-slack-hook need jq.
+SLACK_BINS = ("cc-slack", "cc-slack-card", "cc-slack-hook")
 
 
 def _slack_keychain_get() -> str | None:
@@ -782,13 +784,15 @@ def auth_slack(
             fg="yellow",
         )
 
-    # The sender itself, same file on both sides (also installed by `sync dotfiles` and the bootstrap).
+    # The sender, the card layout and the hook entry point: same files on both sides (also installed by
+    # `sync dotfiles` and the bootstrap).
     local_bin = Path.home() / ".local" / "bin"
     local_bin.mkdir(parents=True, exist_ok=True)
-    _run(["install", "-m", "755", str(DOTFILES / "cc-slack.sh"), str(local_bin / "cc-slack")])
     _remote(c, "mkdir -p ~/.local/bin")
-    _run([*_scp(c), str(DOTFILES / "cc-slack.sh"), f"{c.target}:~/.local/bin/cc-slack"])
-    _remote(c, "chmod 755 ~/.local/bin/cc-slack")
+    for name in SLACK_BINS:
+        _run(["install", "-m", "755", str(DOTFILES / f"{name}.sh"), str(local_bin / name)])
+        _run([*_scp(c), str(DOTFILES / f"{name}.sh"), f"{c.target}:~/.local/bin/{name}"])
+    _remote(c, "chmod 755 " + " ".join(f"~/.local/bin/{n}" for n in SLACK_BINS))
     if not _install_claude_notify(c):
         typer.secho("  the hook/skill install reported a problem (see above)", fg="yellow")
 
@@ -1765,9 +1769,15 @@ DOTFILE_BINS = {
     "aws-sso-state.sh": "aws-sso-state",
     "gcp-auth-state.sh": "gcp-auth-state",
     "cc-slack.sh": "cc-slack",
+    "cc-slack-card.sh": "cc-slack-card",
+    "cc-slack-hook.sh": "cc-slack-hook",
 }
 # Called on both machines: the state scripts by the shared starship.toml, cc-slack by Claude Code's hooks.
-LAPTOP_BINS = {"aws-sso-state.sh": "aws-sso-state", "gcp-auth-state.sh": "gcp-auth-state", "cc-slack.sh": "cc-slack"}
+LAPTOP_BINS = {
+    "aws-sso-state.sh": "aws-sso-state",
+    "gcp-auth-state.sh": "gcp-auth-state",
+    **{f"{n}.sh": n for n in ("cc-slack", "cc-slack-card", "cc-slack-hook")},
+}
 # The bootstrap copies tmux.conf only when the box has none; sync pushes it unconditionally and re-sources it.
 TMUX_CONF = "tmux.conf"
 # Sampler for sparkbar's history; runs under the systemd user manager so it keeps sampling while no tmux client is attached.
