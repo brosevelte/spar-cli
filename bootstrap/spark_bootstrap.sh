@@ -213,6 +213,8 @@ if [ -n "$SELF_DOTFILES" ] && [ -d "$SELF_DOTFILES" ]; then
   install -m 755 "$SELF_DOTFILES/aws-sso-state.sh" "$HOME/.local/bin/aws-sso-state"
   install -m 755 "$SELF_DOTFILES/gcp-auth-state.sh" "$HOME/.local/bin/gcp-auth-state"
   install -m 755 "$SELF_DOTFILES/cc-slack.sh" "$HOME/.local/bin/cc-slack"
+  # Claude Code's half of the Slack pings: Notification hook (merged into settings.json) + /away-mode skill.
+  python3 -I "$SELF_DOTFILES/claude-notify-install.py" "$SELF_DOTFILES" || echo "  claude-notify install reported a problem (above)"
   # sparkbar's sampler: keeps vitals history rolling while no tmux client is attached.
   mkdir -p "$HOME/.config/systemd/user"
   install -m 644 "$SELF_DOTFILES/sparkbar-sampler.service" "$HOME/.config/systemd/user/sparkbar-sampler.service"

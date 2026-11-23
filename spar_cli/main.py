@@ -789,6 +789,8 @@ def auth_slack(
     _remote(c, "mkdir -p ~/.local/bin")
     _run([*_scp(c), str(DOTFILES / "cc-slack.sh"), f"{c.target}:~/.local/bin/cc-slack"])
     _remote(c, "chmod 755 ~/.local/bin/cc-slack")
+    if not _install_claude_notify(c):
+        typer.secho("  the hook/skill install reported a problem (see above)", fg="yellow")
 
     if test and (target or (local_dir / "target").exists()):
         msg = "spark auth slack: test from {}"
@@ -804,6 +806,20 @@ def auth_slack(
 
 def _remote_rc(c: cfg.Config, script: str) -> int:
     return _run([*_ssh_base(c), _bash(REMOTE_PATH + script, login=True)], check=False).returncode
+
+
+NOTIFY_INSTALLER = "claude-notify-install.py"
+NOTIFY_STAGE = ".cache/spar-cli/claude-notify"  # under the box's $HOME; the installer and skills, re-pushed each run
+
+
+def _install_claude_notify(c: cfg.Config) -> bool:
+    """Claude Code's half of Slack pings, on BOTH machines: the Notification hook that pipes into cc-slack (merged into ~/.claude/settings.json) and the /away-mode skill. The same stdlib-only dotfiles/claude-notify-install.py does the work on each side, so the Mac and the box can't drift. False if either side failed (bad settings.json, no jq); the other side is still done."""
+    installer = DOTFILES / NOTIFY_INSTALLER
+    local = subprocess.run([sys.executable, "-I", str(installer), str(DOTFILES)], check=False).returncode
+    _remote(c, f"mkdir -p ~/{NOTIFY_STAGE}")
+    _run([*_rsync(c), "-a", "--delete", str(installer), str(DOTFILES / "claude-skills"), f"{c.target}:{NOTIFY_STAGE}/"])
+    remote = _remote_rc(c, f"python3 -I ~/{NOTIFY_STAGE}/{NOTIFY_INSTALLER} ~/{NOTIFY_STAGE}")
+    return local == remote == 0
 
 
 # --------------------------------------------------------------------------- gcp
@@ -1794,6 +1810,8 @@ def sync_dotfiles() -> None:
         f"systemctl --user daemon-reload && systemctl --user enable --now {SAMPLER_UNIT} && systemctl --user restart {SAMPLER_UNIT}",
     )
     _remote(c, "tmux source-file ~/.tmux.conf 2>/dev/null; tmux refresh-client -S 2>/dev/null; true")
+    if not _install_claude_notify(c):
+        typer.secho("Claude Code Slack hook/skill install reported a problem (see above)", fg="yellow")
     typer.secho(
         f"dotfiles pushed: {', '.join(DOTFILE_BINS.values())} -> ~/.local/bin, {SAMPLER_UNIT} (restarted), {local_starship} -> {remote_starship}",
         fg="green",
