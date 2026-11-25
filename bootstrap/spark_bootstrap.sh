@@ -212,7 +212,7 @@ if [ -n "$SELF_DOTFILES" ] && [ -d "$SELF_DOTFILES" ]; then
   install -m 755 "$SELF_DOTFILES/tmux-osc52.sh" "$HOME/.local/bin/tmux-osc52"
   install -m 755 "$SELF_DOTFILES/aws-sso-state.sh" "$HOME/.local/bin/aws-sso-state"
   install -m 755 "$SELF_DOTFILES/gcp-auth-state.sh" "$HOME/.local/bin/gcp-auth-state"
-  for b in cc-slack cc-slack-card cc-slack-hook; do install -m 755 "$SELF_DOTFILES/$b.sh" "$HOME/.local/bin/$b"; done
+  for b in cc-slack cc-slack-card cc-slack-hook cc-slack-wait; do install -m 755 "$SELF_DOTFILES/$b.sh" "$HOME/.local/bin/$b"; done
   # Claude Code's half of the Slack pings: Notification hook (merged into settings.json) + /away-mode skill.
   python3 -I "$SELF_DOTFILES/claude-notify-install.py" "$SELF_DOTFILES" || echo "  claude-notify install reported a problem (above)"
   # sparkbar's sampler: keeps vitals history rolling while no tmux client is attached.

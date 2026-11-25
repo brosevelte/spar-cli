@@ -54,6 +54,14 @@ if [ "${1:-}" = --check ]; then
   esac
 fi
 
+# cc-slack --api <method> [curl args...]: call any Slack Web API method with the bot token and print the
+# raw JSON. For the other cc-slack-* scripts, so the token lookup lives in this file only.
+if [ "${1:-}" = --api ]; then
+  shift
+  api "$@"
+  exit
+fi
+
 target=${CC_SLACK_TARGET:-}
 if [ -z "$target" ] && [ -r "$DIR/target" ]; then
   target=$(tr -d '[:space:]' <"$DIR/target")
@@ -74,7 +82,14 @@ if [ -n "${CC_SLACK_BLOCKS:-}" ]; then
 fi
 out=$(api chat.postMessage "${args[@]}")
 case $out in
-*'"ok":true'*) exit 0 ;;
+*'"ok":true'*)
+  # $CC_SLACK_PRINT_REF=1: print "<channel id> <message ts>", which is what cc-slack-wait takes to
+  # watch this message's thread for a reply.
+  if [ -n "${CC_SLACK_PRINT_REF:-}" ]; then
+    printf '%s' "$out" | jq -r '.channel + " " + .ts'
+  fi
+  exit 0
+  ;;
 *)
   echo "cc-slack: chat.postMessage failed: $out" >&2
   exit 1

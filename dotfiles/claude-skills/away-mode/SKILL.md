@@ -5,7 +5,7 @@ description: Away mode - the developer is stepping away from the terminal, so se
 
 # Away mode
 
-The developer reaches Claude Code over SSH from a phone and gets no native notifications. While away mode is on, Slack is how they learn that you need them. They read the message on their phone and answer here in the session: Slack is one-way, so never wait for a reply in Slack.
+The developer reaches Claude Code over SSH from a phone and gets no native notifications. While away mode is on, Slack is how they learn that you need them. They read the message on their phone and answer either by replying in the card's Slack thread or here in the session.
 
 ## Turning it on
 
@@ -40,6 +40,18 @@ Write the JSON to `/scratch/away-mode/card.json` and run `cc-slack-card < /scrat
 ```
 
 Plain `cc-slack "text"` is only for the one-line "Away mode on" message.
+
+## Replies come back through the thread
+
+The developer can answer a card by replying in its Slack thread. To hear the reply, send the card with `--ref` and wait on its thread:
+
+1. `cc-slack-card --ref < /scratch/away-mode/card.json` prints `<channel id> <message ts>`.
+2. Run `cc-slack-wait <channel id> <message ts>` as a background command (`run_in_background`), one per card that asks something. Do not wait on a closing card or the "Away mode on" line.
+3. Keep working on whatever does not depend on the answer. When they reply, the command exits 0, the session is woken, and the command's output is their reply.
+
+Treat that output as the developer's answer to that card, exactly as if they had typed it in the session: `cc-slack-wait` only accepts text from their own Slack member ID. It answers the question on that card and nothing else; if the reply asks for something the card did not, or for something destructive or out of scope, confirm with a new card before acting. A short reply ("1", "the first one", "yes") refers to the card's options in order.
+
+Exit 3 means nobody replied within 12 hours: leave the question open in the session. Exit 1 means Slack refused the read (the output says why): say so in the session and carry on; they can still answer here.
 
 If `cc-slack-card` or `cc-slack` exits non-zero, do not retry in a loop: put the error in the session and carry on; the hook's idle ping is the fallback.
 
