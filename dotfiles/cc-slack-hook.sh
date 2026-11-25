@@ -9,7 +9,7 @@
 #   notify   ping ONCE per request (Notification: permission_prompt, elicitation_dialog, agent_needs_input)
 #   idle     ping ONCE per message the developer typed (Notification: idle_prompt, which repeats about every
 #            minute, and again after every wake by a background agent)
-#   clear    the question was answered (PostToolUse on AskUserQuestion): forget it
+#   clear    a tool ran (PostToolUse, every tool): its request is answered, stop any hook waiting on it
 #   reset    a prompt was submitted, by the developer or by a wake (UserPromptSubmit): forget the pending request
 #
 # State: per-session files in ~/.cache/claude-notify/ (<session>.pending = the stashed hook payload,
@@ -52,23 +52,50 @@ ask)
   #   anything else                   -> deny, with the reply passed to Claude as the reason
   # No reply, or Slack cannot be read: exit with no output, which is no decision, so the prompt simply
   # stays where it is at the keyboard. The reason goes to sent.log.
+  #
+  # Claude Code does not stop this hook when the prompt is answered at the keyboard, so `clear` (the
+  # tool ran) and `reset` (a new prompt) drop a .cancel file next to this request's .wait file, and the
+  # loops below stop on it. Without that, every keyboard-answered prompt would leave a poller running.
   printf '%s\n' "$payload" >"$pending"
   rm -f "$asked"
-  ref="$dir/$session.$(reqid <<<"$payload").ref"
-  rm -f "$ref"
+  req="$dir/$session.$(reqid <<<"$payload")"
+  ref="$req.ref"
+  rm -f "$ref" "$req.cancel"
+  : >"$req.wait"
+  trap 'rm -f "$req.wait" "$req.cancel" "$ref"' EXIT
   deadline=$(($(date +%s) + ${CC_SLACK_ASK_TIMEOUT:-14400}))
   while [ ! -s "$ref" ]; do
+    [ ! -e "$req.cancel" ] || exit 0
     [ "$(date +%s)" -lt "$deadline" ] || exit 0
     sleep 1
   done
   read -r channel ts <"$ref"
-  rm -f "$ref"
-  rc=0
-  reply=$("$HOME/.local/bin/cc-slack-wait" "$channel" "$ts" "$((deadline - $(date +%s)))") || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    log "no decision from Slack (cc-slack-wait exit $rc)"
-    exit 0
-  fi
+  say() { # one line in the card's thread; a failure to post it must not change the decision
+    "$HOME/.local/bin/cc-slack" --api chat.postMessage --data-urlencode "channel=$channel" \
+      --data-urlencode "thread_ts=$ts" --data-urlencode "text=$1" >/dev/null ||
+      log "could not post in the thread: $1"
+  }
+  while :; do
+    if [ -e "$req.cancel" ]; then
+      log "answered directly"
+      say ":keyboard: Answered directly"
+      exit 0
+    fi
+    rc=0
+    reply=$("$HOME/.local/bin/cc-slack-wait" "$channel" "$ts" 0 2>"$req.err") || rc=$?
+    [ "$rc" -ne 0 ] || break
+    if [ "$rc" -ne 3 ]; then # 3 = no reply yet; anything else is Slack refusing the read
+      log "no decision from Slack (cc-slack-wait exit $rc: $(head -c 300 "$req.err"))"
+      rm -f "$req.err"
+      exit 0
+    fi
+    rm -f "$req.err"
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "no reply from Slack before the deadline"
+      exit 0
+    fi
+    sleep 4
+  done
   word=$(head -n 1 <<<"$reply" | tr '[:upper:]' '[:lower:]' | tr -d '[:punct:][:space:]')
   case $word in
   yes | y | ok | okay | approve | approved | allow | allowed | go | doit)
@@ -86,17 +113,26 @@ ask)
     ;;
   esac
   log "decided from Slack: $note"
-  "$HOME/.local/bin/cc-slack" --api chat.postMessage --data-urlencode "channel=$channel" \
-    --data-urlencode "thread_ts=$ts" --data-urlencode "text=$note" >/dev/null ||
-    log "could not post the confirmation in the thread"
+  say "$note"
   jq -cn --argjson d "$decision" '{hookSpecificOutput: {hookEventName: "PermissionRequest", decision: $d}}'
   exit 0
   ;;
 clear)
-  rm -f "$pending" "$asked"
+  # PostToolUse, every tool: this tool ran, so its request (if a hook is still waiting on it) is answered.
+  req="$dir/$session.$(reqid <<<"$payload")"
+  if [ -e "$req.wait" ]; then
+    : >"$req.cancel"
+    rm -f "$pending" "$asked"
+  fi
+  if [ "$(jq -r '.tool_name // ""' <<<"$payload")" = AskUserQuestion ]; then
+    rm -f "$pending" "$asked"
+  fi
   exit 0
   ;;
 reset)
+  for w in "$dir/$session".*.wait; do
+    [ -e "$w" ] && : >"${w%.wait}.cancel"
+  done
   # UserPromptSubmit also fires when a background agent or task wakes the session, so it must not
   # re-arm the idle ping: `idle` decides that itself from who typed last.
   rm -f "$pending" "$asked"

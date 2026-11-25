@@ -34,7 +34,9 @@ def _cmd(kind: str, timeout: int | None = None) -> dict:
 # was installed and tested by hand; see dotfiles/cc-slack-hook.sh for what each kind does.
 HOOKS: dict[str, list[dict]] = {
     "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [_cmd("stash")]}],
-    "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [_cmd("clear")]}],
+    # Every tool, no matcher: a tool that ran has had its permission request answered, so `clear` stops
+    # the `ask` hook still waiting on Slack for it (Claude Code does not stop that hook itself).
+    "PostToolUse": [{"hooks": [_cmd("clear")]}],
     # `ask` stays alive up to 4 hours waiting for a Slack thread reply that answers the prompt, so it
     # needs more than the default 600-second hook timeout (a minute over the script's own deadline).
     "PermissionRequest": [{"hooks": [_cmd("ask", timeout=14460)]}],
