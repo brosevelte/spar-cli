@@ -5,6 +5,7 @@
 #   stash    remember what is being asked (PermissionRequest; PreToolUse on AskUserQuestion). Sends nothing:
 #            Claude Code's own Notification fires a few seconds later, only if nobody answered at the keyboard,
 #            and that notification carries no detail, so the detail is kept here for it.
+#   ask      PermissionRequest: stash, then wait for a Slack thread reply and answer the prompt with it
 #   notify   ping ONCE per request (Notification: permission_prompt, elicitation_dialog, agent_needs_input)
 #   idle     ping ONCE per message the developer typed (Notification: idle_prompt, which repeats about every
 #            minute, and again after every wake by a background agent)
@@ -16,7 +17,7 @@
 # is accepted, so a failed send is retried on the next idle notification.
 set -euo pipefail
 
-kind=${1:?usage: cc-slack-hook stash|notify|idle|clear|reset}
+kind=${1:?usage: cc-slack-hook stash|ask|notify|idle|clear|reset}
 payload=$(cat)
 session=$(jq -r '.session_id // "unknown"' <<<"$payload")
 dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-notify"
@@ -28,6 +29,10 @@ chmod 700 "$dir"
 
 # Every send and every dropped repeat is logged, so "what is pinging me?" is answered by reading
 # ~/.cache/claude-notify/sent.log, not by guessing.
+# One permission request's id: the same request hashed by `ask` (from its own payload) and by `notify`
+# (from the stashed copy), so the card's thread reference reaches the hook that is waiting on it.
+reqid() { jq -cS '{tool_name, tool_input}' | sha1sum | cut -c1-12; }
+
 log() { printf '%s %s %s %s\n' "$(date '+%F %T')" "${session:0:8}" "$kind" "$*" >>"$dir/sent.log"; }
 
 case $kind in
@@ -35,6 +40,56 @@ stash)
   # A new request: it may ping even if the last one already did.
   printf '%s\n' "$payload" >"$pending"
   rm -f "$asked"
+  exit 0
+  ;;
+ask)
+  # PermissionRequest: stash the request like `stash`, then stay alive so a Slack thread reply can answer
+  # the prompt. Nothing is sent from here: Claude Code's Notification fires about 6 seconds later if
+  # nobody answered at the keyboard, `notify` sends the card and writes its thread reference to
+  # <session>.<request id>.ref, and this hook then waits on that thread.
+  #   yes / y / ok / approve / allow  -> allow
+  #   no / n / deny / reject / stop   -> deny
+  #   anything else                   -> deny, with the reply passed to Claude as the reason
+  # No reply, or Slack cannot be read: exit with no output, which is no decision, so the prompt simply
+  # stays where it is at the keyboard. The reason goes to sent.log.
+  printf '%s\n' "$payload" >"$pending"
+  rm -f "$asked"
+  ref="$dir/$session.$(reqid <<<"$payload").ref"
+  rm -f "$ref"
+  deadline=$(($(date +%s) + ${CC_SLACK_ASK_TIMEOUT:-14400}))
+  while [ ! -s "$ref" ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || exit 0
+    sleep 1
+  done
+  read -r channel ts <"$ref"
+  rm -f "$ref"
+  rc=0
+  reply=$("$HOME/.local/bin/cc-slack-wait" "$channel" "$ts" "$((deadline - $(date +%s)))") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "no decision from Slack (cc-slack-wait exit $rc)"
+    exit 0
+  fi
+  word=$(head -n 1 <<<"$reply" | tr '[:upper:]' '[:lower:]' | tr -d '[:punct:][:space:]')
+  case $word in
+  yes | y | ok | okay | approve | approved | allow | allowed | go | doit)
+    decision='{"behavior":"allow"}'
+    note=":white_check_mark: Approved"
+    ;;
+  no | n | deny | denied | reject | rejected | stop | dont)
+    decision='{"behavior":"deny","message":"The developer denied this from Slack."}'
+    note=":no_entry: Denied"
+    ;;
+  *)
+    decision=$(jq -cn --arg r "$reply" \
+      '{behavior: "deny", message: ("The developer did not approve this. They replied from Slack: " + $r)}')
+    note=":no_entry: Denied, and your reply was passed to Claude"
+    ;;
+  esac
+  log "decided from Slack: $note"
+  "$HOME/.local/bin/cc-slack" --api chat.postMessage --data-urlencode "channel=$channel" \
+    --data-urlencode "thread_ts=$ts" --data-urlencode "text=$note" >/dev/null ||
+    log "could not post the confirmation in the thread"
+  jq -cn --argjson d "$decision" '{hookSpecificOutput: {hookEventName: "PermissionRequest", decision: $d}}'
   exit 0
   ;;
 clear)
@@ -71,7 +126,7 @@ notify)
   fi
   ;;
 *)
-  echo "cc-slack-hook: unknown kind '$kind' (stash|notify|idle|clear|reset)" >&2
+  echo "cc-slack-hook: unknown kind '$kind' (stash|ask|notify|idle|clear|reset)" >&2
   exit 2
   ;;
 esac
@@ -81,6 +136,7 @@ transcript=$(jq -r '.transcript_path // ""' <<<"$payload")
 # Cards, one JSON object per line: the stashed request if there is a recent one (2 minutes), one card per
 # question; else Claude Code's own notification text.
 cards=""
+refid=""
 if [ -n "$(find "$pending" -mmin -2 2>/dev/null)" ]; then
   cards=$(jq -c --arg transcript "$transcript" '
     if .tool_name == "AskUserQuestion" then
@@ -91,8 +147,12 @@ if [ -n "$(find "$pending" -mmin -2 2>/dev/null)" ]; then
     else
       {icon: ":lock:", title: ("Permission needed: " + (.tool_name // "a tool")),
        code: (.tool_input.command // .tool_input.file_path // (.tool_input | tojson)),
-       detail: (.tool_input.description // ""), transcript_path: $transcript}
+       detail: ([(.tool_input.description // empty), "Reply `yes` or `no` in this thread, or answer in the terminal."] | join(" · ")),
+       transcript_path: $transcript}
     end' "$pending")
+  if [ "$(jq -r '.tool_name // ""' "$pending")" != AskUserQuestion ]; then
+    refid=$(reqid <"$pending")
+  fi
   rm -f "$pending"
 fi
 if [ -z "$cards" ]; then
@@ -103,7 +163,13 @@ if [ -z "$cards" ]; then
 fi
 
 while IFS= read -r card; do
-  printf '%s\n' "$card" | "$HOME/.local/bin/cc-slack-card"
+  if [ -n "$refid" ]; then
+    # A permission card: hand its thread reference to the `ask` hook waiting on this request.
+    printf '%s\n' "$card" | "$HOME/.local/bin/cc-slack-card" --ref >"$dir/$session.$refid.ref.tmp"
+    mv "$dir/$session.$refid.ref.tmp" "$dir/$session.$refid.ref"
+  else
+    printf '%s\n' "$card" | "$HOME/.local/bin/cc-slack-card"
+  fi
   log "sent: $(jq -r '.title' <<<"$card")"
 done <<<"$cards"
 
