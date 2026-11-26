@@ -39,6 +39,21 @@ while :; do
       | select(($target | startswith("U") | not) or .user == $target)
       | .text ] | join("\n")' <<<"$out")
   if [ -n "$reply" ]; then
+    # React to each reply taken, so the developer can see in Slack that it was picked up and not sent
+    # after the wait had ended. The emoji is $CC_SLACK_ACK_EMOJI (default "acknowledged"). Needs the bot
+    # scope reactions:write. A failed reaction is reported on stderr and does not lose the reply.
+    while IFS= read -r reply_ts; do
+      ack=$("$HOME/.local/bin/cc-slack" --api reactions.add --data-urlencode "channel=$channel" \
+        --data-urlencode "timestamp=$reply_ts" --data-urlencode "name=${CC_SLACK_ACK_EMOJI:-acknowledged}")
+      case $(jq -r '.error // "ok"' <<<"$ack") in
+      ok | already_reacted) ;;
+      *) echo "cc-slack-wait: could not react to the reply: $ack" >&2 ;;
+      esac
+    done < <(jq -r --arg ts "$ts" --arg target "$target" '
+      .messages[]
+      | select(.ts != $ts and (.bot_id // "") == "")
+      | select(($target | startswith("U") | not) or .user == $target)
+      | .ts' <<<"$out")
     printf '%s\n' "$reply"
     exit 0
   fi
