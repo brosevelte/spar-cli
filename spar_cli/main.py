@@ -694,7 +694,7 @@ def auth_claude(
 SLACK_KEYCHAIN_SERVICE = "spar-cli-slack"  # must match KEYCHAIN_SERVICE in dotfiles/cc-slack.sh
 SLACK_DIR = ".config/claude-notify"  # under $HOME on both machines: `token` (box only) and `target`
 # dotfiles/<name>.sh -> ~/.local/bin/<name> on both machines. cc-slack-card and cc-slack-hook need jq.
-SLACK_BINS = ("cc-slack", "cc-slack-card", "cc-slack-hook")
+SLACK_BINS = ("cc-slack", "cc-slack-card", "cc-slack-hook", "cc-slack-wait")
 
 
 def _slack_keychain_get() -> str | None:
@@ -1773,12 +1773,13 @@ DOTFILE_BINS = {
     "cc-slack.sh": "cc-slack",
     "cc-slack-card.sh": "cc-slack-card",
     "cc-slack-hook.sh": "cc-slack-hook",
+    "cc-slack-wait.sh": "cc-slack-wait",
 }
 # Called on both machines: the state scripts by the shared starship.toml, cc-slack by Claude Code's hooks.
 LAPTOP_BINS = {
     "aws-sso-state.sh": "aws-sso-state",
     "gcp-auth-state.sh": "gcp-auth-state",
-    **{f"{n}.sh": n for n in ("cc-slack", "cc-slack-card", "cc-slack-hook")},
+    **{f"{n}.sh": n for n in ("cc-slack", "cc-slack-card", "cc-slack-hook", "cc-slack-wait")},
 }
 # The bootstrap copies tmux.conf only when the box has none; sync pushes it unconditionally and re-sources it.
 TMUX_CONF = "tmux.conf"

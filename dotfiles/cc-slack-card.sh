@@ -21,6 +21,11 @@
 #   echo '{"icon":":question:","title":"Upload limit","question":"Reject or chunk?","options":["Reject","Chunk"]}' | cc-slack-card
 set -euo pipefail
 
+# cc-slack-card --ref: also print "<channel id> <message ts>" for cc-slack-wait.
+if [ "${1:-}" = --ref ]; then
+  export CC_SLACK_PRINT_REF=1
+fi
+
 card=$(cat)
 jq -e '(.title // "") != ""' <<<"$card" >/dev/null || {
   echo 'cc-slack-card: the JSON on stdin needs a "title"' >&2

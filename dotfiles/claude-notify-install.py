@@ -23,16 +23,23 @@ import tempfile
 from pathlib import Path
 
 
-def _cmd(kind: str) -> dict:
-    return {"type": "command", "command": f'"$HOME"/.local/bin/cc-slack-hook {kind}'}
+def _cmd(kind: str, timeout: int | None = None) -> dict:
+    cmd: dict = {"type": "command", "command": f'"$HOME"/.local/bin/cc-slack-hook {kind}'}
+    if timeout is not None:
+        cmd["timeout"] = timeout
+    return cmd
 
 
 # event -> our entries, appended after whatever else the event holds. Copied from the box, where it
 # was installed and tested by hand; see dotfiles/cc-slack-hook.sh for what each kind does.
 HOOKS: dict[str, list[dict]] = {
     "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [_cmd("stash")]}],
-    "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [_cmd("clear")]}],
-    "PermissionRequest": [{"hooks": [_cmd("stash")]}],
+    # Every tool, no matcher: a tool that ran has had its permission request answered, so `clear` stops
+    # the `ask` hook still waiting on Slack for it (Claude Code does not stop that hook itself).
+    "PostToolUse": [{"hooks": [_cmd("clear")]}],
+    # `ask` stays alive up to 4 hours waiting for a Slack thread reply that answers the prompt, so it
+    # needs more than the default 600-second hook timeout (a minute over the script's own deadline).
+    "PermissionRequest": [{"hooks": [_cmd("ask", timeout=14460)]}],
     # No idle_prompt entry, on purpose: "Claude is waiting for your input" fires after every turn,
     # including every wake by a background agent, and was pure noise (Carter, 2026-11-23). A ping
     # means a question or a permission request; a session that has finished says so itself with a
